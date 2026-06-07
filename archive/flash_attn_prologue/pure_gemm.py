@@ -1,0 +1,255 @@
+import os
+import torch
+
+# Set architecture target to Blackwell
+os.environ["CUTE_DSL_ARCH"] = "sm_120a"
+os.environ["QUACK_ARCH"] = "sm_120a"
+
+import cutlass
+import cutlass.cute as cute
+from cutlass import BFloat16, Float32
+
+class PureGemmCute:
+    def __init__(self, num_warps: int = 4, BLOCK_M: int = 64, BLOCK_K: int = 512, NUM_HEADS: int = 16, HEAD_DIM: int = 64):
+        self.num_warps = num_warps
+        self.BLOCK_M = BLOCK_M
+        self.BLOCK_K = BLOCK_K
+        self.NUM_HEADS = NUM_HEADS
+        self.HEAD_DIM = HEAD_DIM
+        self.BLOCK_K_TILE = 32
+        
+    def _setup(self):
+        # 1. Setup shared memory layouts
+        self.smem_x_layout = cute.make_layout((self.BLOCK_M, self.BLOCK_K_TILE), stride=(self.BLOCK_K_TILE, 1))
+        self.smem_w_layout = cute.make_layout((3 * self.HEAD_DIM, self.BLOCK_K_TILE), stride=(self.BLOCK_K_TILE, 1))
+        self.smem_accum_layout = cute.make_layout((self.BLOCK_M, 3 * self.HEAD_DIM), stride=(3 * self.HEAD_DIM, 1))
+        
+        # 2. Shared storage definition (Fits in 64 KB)
+        @cute.struct
+        class SharedStorageGemm:
+            sX: cute.struct.Align[cute.struct.MemRange[BFloat16, self.BLOCK_M * self.BLOCK_K_TILE], 128]
+            sW: cute.struct.Align[cute.struct.MemRange[BFloat16, 3 * self.HEAD_DIM * self.BLOCK_K_TILE], 128]
+            sBuf: cute.struct.Align[cute.struct.MemRange[Float32, self.BLOCK_M * 3 * self.HEAD_DIM], 128]
+        self.shared_storage = SharedStorageGemm
+        
+        # 3. TiledCopy configurations using cp.async
+        copy_op = cute.nvgpu.cpasync.CopyG2SOp()
+        copy_atom = cute.make_copy_atom(copy_op, BFloat16, num_bits_per_copy=128)
+        
+        self.gmem_tiled_copy_x = cute.make_tiled_copy_tv(
+            copy_atom,
+            cute.make_ordered_layout((32, 4), order=(1, 0)),
+            cute.make_layout((1, 8)) # 8 elements of BFloat16 = 128 bits
+        )
+        self.gmem_tiled_copy_w = cute.make_tiled_copy_tv(
+            copy_atom,
+            cute.make_ordered_layout((32, 4), order=(1, 0)),
+            cute.make_layout((1, 8)) # 8 elements of BFloat16 = 128 bits
+        )
+        
+        # 4. TiledMMA configuration
+        from cutlass.cute.nvgpu.warp import MmaF16BF16Op
+        self.mma = MmaF16BF16Op(BFloat16, Float32, (16, 8, 16))
+        self.tiled_mma = cute.make_tiled_mma(self.mma, atom_layout_mnk=(2, 2, 1))
+
+    @cute.jit
+    def __call__(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        qkv_out: cute.Tensor,
+        stream
+    ):
+        self._setup()
+        B = x.shape[0]
+        N = x.shape[1]
+        num_threads = self.num_warps * cute.arch.WARP_SIZE
+        
+        self.kernel(
+            x, weight, qkv_out,
+            self.smem_x_layout, self.smem_w_layout, self.smem_accum_layout,
+            self.tiled_mma, self.gmem_tiled_copy_x, self.gmem_tiled_copy_w
+        ).launch(
+            grid=[cute.ceil_div(N, self.BLOCK_M), B, self.NUM_HEADS],
+            block=[num_threads, 1, 1],
+            stream=stream
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        qkv_out: cute.Tensor,
+        smem_x_layout: cute.Layout,
+        smem_w_layout: cute.Layout,
+        smem_accum_layout: cute.Layout,
+        tiled_mma: cute.TiledMma,
+        gmem_tiled_copy_x: cute.TiledCopy,
+        gmem_tiled_copy_w: cute.TiledCopy
+    ):
+        cta_m, cta_b, cta_h = cute.arch.block_idx()
+        tid, _, _ = cute.arch.thread_idx()
+        
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(self.shared_storage)
+        
+        smem_x = storage.sX.get_tensor(smem_x_layout)
+        smem_w = storage.sW.get_tensor(smem_w_layout)
+        smem_accum = storage.sBuf.get_tensor(smem_accum_layout)
+        
+        seq_start = cta_m * self.BLOCK_M
+        N = x.shape[1]
+        
+        thr_copy_x = gmem_tiled_copy_x.get_slice(tid)
+        thr_copy_w = gmem_tiled_copy_w.get_slice(tid)
+        thr_mma = tiled_mma.get_slice(tid)
+        
+        tCsC = thr_mma.partition_C(smem_accum)
+        accum = tiled_mma.make_fragment_C(tCsC)
+        accum.fill(0.0)
+        
+        for k_tile in range(0, self.BLOCK_K, self.BLOCK_K_TILE):
+            x_ptr = (x[cta_b, seq_start, None].iterator + k_tile).align(16)
+            gX_layout = cute.make_layout((self.BLOCK_M, self.BLOCK_K_TILE), stride=(self.BLOCK_K, 1))
+            gX = cute.make_tensor(x_ptr, gX_layout)
+            
+            sX_aligned = cute.make_tensor(smem_x.iterator.align(16), smem_x.layout)
+            tSgX = thr_copy_x.partition_S(gX)
+            tSsX = thr_copy_x.partition_D(sX_aligned)
+            cute.copy(gmem_tiled_copy_x, tSgX, tSsX)
+            
+            sW_sub_layout = cute.make_layout((self.HEAD_DIM, self.BLOCK_K_TILE), stride=(self.BLOCK_K_TILE, 1))
+
+            # Q Weight
+            weight_ptr_q = (weight[cta_h * self.HEAD_DIM, None].iterator + k_tile).align(16)
+            gW_q_layout = cute.make_layout((self.HEAD_DIM, self.BLOCK_K_TILE), stride=(self.BLOCK_K, 1))
+            gW_q = cute.make_tensor(weight_ptr_q, gW_q_layout)
+            sW_q = cute.make_tensor(smem_w.iterator.align(16), sW_sub_layout)
+            tSgW_q = thr_copy_w.partition_S(gW_q)
+            tSsW_q = thr_copy_w.partition_D(sW_q)
+            cute.copy(gmem_tiled_copy_w, tSgW_q, tSsW_q)
+
+            # K Weight
+            weight_ptr_k = (weight[(self.NUM_HEADS + cta_h) * self.HEAD_DIM, None].iterator + k_tile).align(16)
+            gW_k_layout = cute.make_layout((self.HEAD_DIM, self.BLOCK_K_TILE), stride=(self.BLOCK_K, 1))
+            gW_k = cute.make_tensor(weight_ptr_k, gW_k_layout)
+            sW_k = cute.make_tensor((smem_w.iterator + self.HEAD_DIM * self.BLOCK_K_TILE).align(16), sW_sub_layout)
+            tSgW_k = thr_copy_w.partition_S(gW_k)
+            tSsW_k = thr_copy_w.partition_D(sW_k)
+            cute.copy(gmem_tiled_copy_w, tSgW_k, tSsW_k)
+
+            # V Weight
+            weight_ptr_v = (weight[(2 * self.NUM_HEADS + cta_h) * self.HEAD_DIM, None].iterator + k_tile).align(16)
+            gW_v_layout = cute.make_layout((self.HEAD_DIM, self.BLOCK_K_TILE), stride=(self.BLOCK_K, 1))
+            gW_v = cute.make_tensor(weight_ptr_v, gW_v_layout)
+            sW_v = cute.make_tensor((smem_w.iterator + 2 * self.HEAD_DIM * self.BLOCK_K_TILE).align(16), sW_sub_layout)
+            tSgW_v = thr_copy_w.partition_S(gW_v)
+            tSsW_v = thr_copy_w.partition_D(sW_v)
+            cute.copy(gmem_tiled_copy_w, tSgW_v, tSsW_v)
+            
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.sync_threads()
+            
+            tAsX = thr_mma.partition_A(smem_x)
+            tBsW = thr_mma.partition_B(smem_w)
+            
+            rA = tiled_mma.make_fragment_A(tAsX)
+            rB = tiled_mma.make_fragment_B(tBsW)
+            
+            for i in range(cute.size(rA)):
+                rA[i] = tAsX[i]
+            for i in range(cute.size(rB)):
+                rB[i] = tBsW[i]
+            
+            cute.gemm(tiled_mma, accum, rA, rB, accum)
+            cute.arch.sync_threads()
+            
+        for i in range(cute.size(accum)):
+            tCsC[i] = accum[i]
+        cute.arch.sync_threads()
+
+        # Vectorized global writeback
+        if tid < self.BLOCK_M and seq_start + tid < N:
+            # Slices of shared memory (using flat layout offsets)
+            q_ptr = smem_accum.iterator + tid * (3 * self.HEAD_DIM)
+            k_ptr = smem_accum.iterator + tid * (3 * self.HEAD_DIM) + self.HEAD_DIM
+            v_ptr = smem_accum.iterator + tid * (3 * self.HEAD_DIM) + 2 * self.HEAD_DIM
+            
+            q_smem = cute.make_tensor(q_ptr, cute.make_layout((self.HEAD_DIM,)))
+            k_smem = cute.make_tensor(k_ptr, cute.make_layout((self.HEAD_DIM,)))
+            v_smem = cute.make_tensor(v_ptr, cute.make_layout((self.HEAD_DIM,)))
+            
+            q_reg = cute.make_rmem_tensor((self.HEAD_DIM,), Float32)
+            k_reg = cute.make_rmem_tensor((self.HEAD_DIM,), Float32)
+            v_reg = cute.make_rmem_tensor((self.HEAD_DIM,), Float32)
+            
+            cute.autovec_copy(q_smem, q_reg)
+            cute.autovec_copy(k_smem, k_reg)
+            cute.autovec_copy(v_smem, v_reg)
+            
+            for j in cutlass.range(self.HEAD_DIM, unroll_full=True):
+                qkv_out[cta_b, seq_start + tid, 0, cta_h, j] = BFloat16(q_reg[j])
+                qkv_out[cta_b, seq_start + tid, 1, cta_h, j] = BFloat16(k_reg[j])
+                qkv_out[cta_b, seq_start + tid, 2, cta_h, j] = BFloat16(v_reg[j])
+
+_pure_gemm_compile_cache = {}
+
+def get_pure_gemm_fwd_kernel(num_warps=4, BLOCK_M=64, BLOCK_K=512, NUM_HEADS=16, HEAD_DIM=64):
+    key = (num_warps, BLOCK_M, BLOCK_K, NUM_HEADS, HEAD_DIM)
+    if key not in _pure_gemm_compile_cache:
+        from quack.compile_utils import make_fake_tensor
+        
+        B_sym = cute.sym_int()
+        N_sym = cute.sym_int()
+        
+        fwd_op = PureGemmCute(num_warps=num_warps, BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K, NUM_HEADS=NUM_HEADS, HEAD_DIM=HEAD_DIM)
+        
+        x_fake = make_fake_tensor(BFloat16, (B_sym, N_sym, BLOCK_K), 16)
+        weight_fake = make_fake_tensor(BFloat16, (3 * NUM_HEADS * HEAD_DIM, BLOCK_K), 16)
+        qkv_out_fake = make_fake_tensor(BFloat16, (B_sym, N_sym, 3, NUM_HEADS, HEAD_DIM), 16)
+        
+        fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        
+        compiled_fwd = cute.compile(
+            fwd_op,
+            x_fake, weight_fake, qkv_out_fake,
+            fake_stream,
+            options="--enable-tvm-ffi",
+        )
+        _pure_gemm_compile_cache[key] = compiled_fwd
+    return _pure_gemm_compile_cache[key]
+
+@torch.library.custom_op("flash_prologue::pure_gemm_cute", mutates_args=())
+def pure_gemm_cute_op(
+    x: torch.Tensor,
+    weight: torch.Tensor
+) -> torch.Tensor:
+    B, N, hidden = x.shape
+    num_heads = weight.shape[0] // 3 // 64 # assumes HEAD_DIM = 64
+    head_dim = 64
+    
+    x_bf16 = x.to(torch.bfloat16).contiguous()
+    weight_bf16 = weight.to(torch.bfloat16).contiguous()
+    
+    qkv_out_bf16 = torch.empty((B, N, 3, num_heads, head_dim), dtype=torch.bfloat16, device=x.device)
+    
+    fwd_kernel = get_pure_gemm_fwd_kernel(
+        num_warps=4,
+        BLOCK_M=64,
+        BLOCK_K=hidden,
+        NUM_HEADS=num_heads,
+        HEAD_DIM=head_dim
+    )
+    
+    fwd_kernel(x_bf16, weight_bf16, qkv_out_bf16)
+    
+    return qkv_out_bf16
+
+@pure_gemm_cute_op.register_fake
+def _pure_gemm_cute_fake(x, weight):
+    B, N, hidden = x.shape
+    num_heads = weight.shape[0] // 3 // 64
+    head_dim = 64
+    return torch.empty((B, N, 3, num_heads, head_dim), dtype=x.dtype, device=x.device)

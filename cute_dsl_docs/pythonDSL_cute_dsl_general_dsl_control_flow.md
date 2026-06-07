@@ -1,0 +1,401 @@
+
+
+Control Flow — NVIDIA CUTLASS Documentation
+
+
+
+[Skip to main content](#main-content)
+
+Back to top
+
+
+
+
+`Ctrl`+`K`
+
+[![NVIDIA CUTLASS Documentation - Home](../../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg)
+![NVIDIA CUTLASS Documentation - Home](../../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg)
+
+NVIDIA CUTLASS Documentation](../../../../index.html)
+
+Choose version
+
+Search
+`Ctrl`+`K`
+
+Search
+`Ctrl`+`K`
+
+[![NVIDIA CUTLASS Documentation - Home](../../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg)
+![NVIDIA CUTLASS Documentation - Home](../../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg)
+
+NVIDIA CUTLASS Documentation](../../../../index.html)
+
+Choose version
+
+Table of Contents
+
+* [Changelog](../../../../CHANGELOG.html)
+
+CuTe DSL
+
+* [Overview](../overview.html)
+* [Functionality](../functionality.html)
+* [Quick Start Guide](../quick_start.html)
+* [CuTe DSL](../cute_dsl.html)
+  + [Introduction](dsl_introduction.html)
+  + [Code Generation](dsl_code_generation.html)
+  + [Control Flow](#)
+  + [JIT Argument Generation](dsl_jit_arg_generation.html)
+  + [JIT Argument: Layouts](dsl_dynamic_layout.html)
+  + [JIT Caching](dsl_jit_caching.html)
+  + [JIT Compilation Options](dsl_jit_compilation_options.html)
+  + [JIT Types](types.html)
+  + [Integration with Frameworks](framework_integration.html)
+  + [Debugging with the DSL](debugging.html)
+  + [Autotuning with the DSL](autotuning_gemm.html)
+  + [Educational Notebooks](notebooks.html)
+  + [Deprecation Policy](../deprecation.html)
+  + [Compile with TVM FFI](compile_with_tvm_ffi.html)
+  + [Ahead-of-Time (AOT) Compilation](dsl_ahead_of_time_compilation.html)
+  + [Talks and Presentations](resources.html)
+* [CuTe DSL API](../cute_dsl_api.html)
+  + [changelog](../cute_dsl_api/changelog.html)
+  + [cute](../cute_dsl_api/cute.html)
+    - [arch](../cute_dsl_api/cute_arch.html)
+    - [Runtime](../cute_dsl_api/cute_runtime.html)
+  + [cute\_nvgpu](../cute_dsl_api/cute_nvgpu.html)
+    - [Common](../cute_dsl_api/cute_nvgpu_common.html)
+    - [warp submodule](../cute_dsl_api/cute_nvgpu_warp.html)
+    - [warpgroup submodule](../cute_dsl_api/cute_nvgpu_warpgroup.html)
+    - [cpasync submodule](../cute_dsl_api/cute_nvgpu_cpasync.html)
+    - [tcgen05 submodule](../cute_dsl_api/cute_nvgpu_tcgen05.html)
+  + [pipeline](../cute_dsl_api/pipeline.html)
+  + [utils](../cute_dsl_api/utils.html)
+    - [Utilities for SM90](../cute_dsl_api/utils_sm90.html)
+    - [Utilities for SM100](../cute_dsl_api/utils_sm100.html)
+* [Limitations](../limitations.html)
+* [FAQs](../faqs.html)
+
+CUTLASS C++
+
+* [Overview](../../../../overview.html)
+* [Getting Started](../../cpp/getting_started.html)
+  + [Quickstart](../../cpp/quickstart.html)
+  + [IDE Setup](../../cpp/ide_setup.html)
+  + [Build](../../cpp/build/index.html)
+    - [Building on Windows with Visual Studio](../../cpp/build/building_in_windows_with_visual_studio.html)
+    - [Building with Clang as host compiler](../../cpp/build/building_with_clang_as_host_compiler.html)
+  + [Functionality](../../cpp/functionality.html)
+  + [Terminology](../../cpp/terminology.html)
+  + [Fundamental Types](../../cpp/fundamental_types.html)
+  + [Programming Guidelines](../../cpp/programming_guidelines.html)
+  + [GEMM Heuristics](../../cpp/heuristics.html)
+* [Efficient GEMM in CUDA](../../cpp/efficient_gemm.html)
+* [Synchronization primitives](../../cpp/pipeline.html)
+* [CUTLASS Profiler](../../cpp/profiler.html)
+* [Dependent Kernel Launch](../../cpp/dependent_kernel_launch.html)
+* [Blackwell Specific](../../cpp/blackwell.html)
+  + [Blackwell SM100 GEMMs](../../cpp/blackwell_functionality.html)
+  + [Blackwell Cluster Launch Control](../../cpp/blackwell_cluster_launch_control.html)
+* [CuTe](../../cpp/cute/index.html)
+  + [00\_quickstart](../../cpp/cute/00_quickstart.html)
+  + [01\_layout](../../cpp/cute/01_layout.html)
+  + [02\_layout\_algebra](../../cpp/cute/02_layout_algebra.html)
+  + [03\_tensor](../../cpp/cute/03_tensor.html)
+  + [04\_algorithms](../../cpp/cute/04_algorithms.html)
+  + [0t\_mma\_atom](../../cpp/cute/0t_mma_atom.html)
+  + [0x\_gemm\_tutorial](../../cpp/cute/0x_gemm_tutorial.html)
+  + [0y\_predication](../../cpp/cute/0y_predication.html)
+  + [0z\_tma\_tensors](../../cpp/cute/0z_tma_tensors.html)
+* [CUTLASS 3.x](../../cpp/cutlass_3x.html)
+  + [Design](../../cpp/cutlass_3x_design.html)
+  + [GEMM Backwards Compatibility](../../cpp/cutlass_3x_backwards_compatibility.html)
+  + [GEMM API](../../cpp/gemm_api_3x.html)
+* [CUTLASS 2.x](../../cpp/cutlass_2x.html)
+  + [Layouts and Tensors](../../cpp/layout.html)
+  + [GEMM API](../../cpp/gemm_api.html)
+  + [Tile Iterator Concepts](../../cpp/tile_iterator_concept.html)
+  + [Utilities](../../cpp/utilities.html)
+* [Code Organization](../../cpp/code_organization.html)
+* [Grouped Kernel Schedulers](../../cpp/grouped_scheduler.html)
+* [CUTLASS Convolution](../../cpp/implicit_gemm_convolution.html)
+
+Reference
+
+* [Software License Agreement](../license.html)
+
+* [CuTe DSL](../cute_dsl.html)
+* Control Flow
+
+# Control Flow[#](#control-flow "Link to this heading")
+
+## Overview[#](#overview "Link to this heading")
+
+CuTe DSL walks Pythonâs AST and converts each control-flow construct it finds into
+structured intermediate representation (IR). You can therefore write ordinary Python loops and branches
+while the compiler decidesâstatement by statementâwhether to
+
+* **evaluate at compile time** if itâs a native Python control flow, or
+* **emit intermediate representation (IR)** when the control flow is marked as dynamic.
+
+Passing intermediate representation (IR) values to a native Python control flow will result in an error.
+
+For a high-level discussion of the overall pipeline, see
+[the code-generation overview](dsl_code_generation.html).
+
+## For Loops[#](#for-loops "Link to this heading")
+
+CuTe DSL recognises three kinds of ranges for `for` loops:
+
+* `range` â the Python built-in, always lowered to intermediate representation (IR)
+* `cutlass.range` - Same as Python built-in `range`, but supports advanced unrolling and pipelining control
+* `cutlass.range_constexpr` â unrolled at compile time
+
+### range(â¦)/cutlass.range(â¦)[#](#range-cutlass-range "Link to this heading")
+
+Use when you *always* want a loop in the generated intermediate representation (IR), even if the inputs
+are Python values.
+
+### cutlass.range\_constexpr(â¦)[#](#cutlass-range-constexpr "Link to this heading")
+
+Runs in the Python interpreter and is fully unrolled before code generation.
+All loop indices must be **Constexpr** (compile-time Python value).
+
+**Example:**
+
+```python
+@cute.jit
+def control_flow_examples(bound: cutlass.Int32):
+    n = 10
+
+    # â This loop is Python loop, evaluated at compile time.
+    for i in cutlass.range_constexpr(n):
+        cute.printf("%d\\n", i)
+
+    # â This loop is dynamic, even when bound is Python value.
+    for i in range(n):
+        cute.printf("%d\\n", i)
+
+    # â This loop bound is a dynamic value, not allowed in Python loop.
+    # Should use `range` instead.
+    for i in cutlass.range_constexpr(bound):
+        cute.printf("%d\\n", i)
+
+    # â This loop is dynamic, emitted IR loop.
+    for i in range(bound):
+        cute.printf("%d\\n", i)
+
+    # â This loop is dynamic, emitted IR loop with unrolling
+    for i in cutlass.range(bound, unroll=2):
+        cute.printf("%d\\n", i)
+```
+
+### Software Pipelining[#](#software-pipelining "Link to this heading")
+
+Software pipelining is a technique used to optimize loops. Typically, this involves writing a prefetch loop and a main loop.
+
+```python
+@cute.jit
+def example():
+    ...
+    # build a circular buffer
+    buffer = ...
+
+    # prefetch loop
+    for i in range(prefetch_stages):
+        cute.copy(atom, gmem[i], buffer[i], ...)
+
+    # main loop
+    for i in range(bound):
+        if i + prefetch_stages < bound:
+            cute.copy(atom, gmem[i + prefetch_stages], buffer[(i + prefetch_stages) % total_stages], ...)
+
+        use(buffer[i % total_stages])
+
+    ...
+```
+
+This can be tedious to write and tune. CuTe DSL provides a loop attribute to ask the compiler to do this.
+
+```python
+@cute.jit
+def example():
+    ...
+    # build a circular buffer
+    buffer = ...
+
+    for i in cutlass.range(bound, prefetch_stages=prefetch_stages):
+        # Compiler automatically handles the pipelining:
+        # - Generates prefetch loop for initial stages
+        # - In main loop, prefetches future data while using current data
+        cute.copy(atom, gmem[i], buffer[i % total_stages], ...)
+        use(buffer[i % total_stages])  # Uses data from previous iterations
+
+    ...
+```
+
+Compiler will automatically generate the prefetch loop with prefetch\_stages iterations and a corresponding main loop.
+
+This feature is experimental and only supported on sm90 and above.
+
+## If-Else Statements[#](#if-else-statements "Link to this heading")
+
+Standard Python `if`/`elif`/`else` is supported.
+
+* **Predicate without annotation** â lowered to intermediate representation (IR).
+* **Predicate annotated with `cutlass.const\_expr`** â evaluated at compile time.
+
+**Example:**
+
+```python
+@cute.jit
+def main(const_var: cutlass.Constexpr, dynamic_var: cutlass.Int32):
+    # â This branch is Python branch, evaluated at compile time.
+    if cutlass.const_expr(const_var):
+        cute.printf("Const branch\\n")
+    else:
+        cute.printf("Const else\\n")
+
+    # â This branch is dynamic branch, emitted IR branch.
+    if dynamic_var == 10:
+        cute.printf("Dynamic True\\n")
+    else:
+        cute.printf("Dynamic False\\n")
+
+    # â Using a dynamic value with `cutlass.const_expr` is not allowed.
+    if cutlass.const_expr(dynamic_var == 10):
+        cute.printf("Bound is 10\\n")
+```
+
+## While Loops[#](#while-loops "Link to this heading")
+
+Standard Python `while` is supported.
+
+* **Condition without annotation** â lowered to intermediate representation (IR).
+* **Condition annotated with `cutlass.const\_expr`** â evaluated at compile time.
+
+**Example:**
+
+```python
+@cute.jit
+def main(dynamic_var: cutlass.Int32):
+    n = 0
+
+    # â This is Python while loop, evaluated at compile time.
+    while cutlass.const_expr(n < 10):
+        cute.printf("Const branch\\n")
+        n += 1
+
+    # â This is dynamic while loop, emitted IR while loop.
+    while dynamic_var == 10:
+        cute.printf("Dynamic True\\n")
+        n += 1
+
+    # â Using a dynamic value with `cutlass.const_expr` is not allowed.
+    while cutlass.const_expr(n < dynamic_var):
+        n += 1
+```
+
+## Summary of Control Flow behavior[#](#summary-of-control-flow-behavior "Link to this heading")
+
+| **Control Flow** | **Run time evaluation** | **Compile time evaluation** |
+| --- | --- | --- |
+| if cutlass.const\_expr() | â | â |
+| if pred | â | â |
+| while cutlass.const\_expr() | â | â |
+| while pred | â | â |
+| for i in cutlass.range\_constexpr() | â | â |
+| for i in range() | â | â |
+| for i in cutlass.range() (support advanced unrolling and pipelining) | â | â |
+
+## Compile-Time Metaprogramming[#](#compile-time-metaprogramming "Link to this heading")
+
+Mix compile-time constructs with normal CuTe DSL code to generate specialised
+kernels without runtime overhead. A compile-time flag can, for example, toggle
+an optional **ReLU** epilogue:
+
+```python
+@cute.kernel
+def gemm(..., do_relu: cutlass.Constexpr):
+    # main GEMM work
+    ...
+    if cutlass.const_expr(do_relu):    # compile-time guard
+        # ReLU code is emitted only when do_relu is True
+        ...
+```
+
+```python
+gemm(..., False)   # ReLU is omitted from the generated |IR|
+gemm(..., True)    # ReLU is included
+```
+
+### Limitations of Dynamic Control Flow[#](#limitations-of-dynamic-control-flow "Link to this heading")
+
+* Early-exit `break`, `continue`, `pass` or raising exception from
+  control flow body are not yet supported.
+* Operations in the control flow body are traced only when tracing is active in
+  that region.
+* Values originating in control flow body are not available outside the control
+  flow.
+* Changing type of a variable in control flow body is not allowed.
+
+**Example:**
+
+```python
+@cute.jit
+def control_flow_negative_examples(predicate: cutlass.Boolean):
+    n = 10
+
+    # â This loop is dynamic, early-exit isn't allowed.
+    for i in range(n):
+        if i == 5:
+            break         # Early-exit
+
+    if predicate:
+        val = 10
+        # â return from control flow body is not allowed.
+        return
+        # â Raising exception from control flow body is not allowed.
+        raise ValueError("This is not allowed")
+        # â Using pass in control flow body is not allowed.
+        pass
+
+    # â val is not available outside the dynamic if
+    cute.printf("%d\\n", val)
+
+    if predicate:
+        # â Changing type of a variable in control flow body is not allowed.
+        n = 10.0
+```
+
+[previous
+
+End-to-End Code Generation](dsl_code_generation.html "previous page")
+[next
+
+JIT Function Argument Generation](dsl_jit_arg_generation.html "next page")
+
+On this page
+
+* [Overview](#overview)
+* [For Loops](#for-loops)
+  + [range(â¦)/cutlass.range(â¦)](#range-cutlass-range)
+  + [cutlass.range\_constexpr(â¦)](#cutlass-range-constexpr)
+  + [Software Pipelining](#software-pipelining)
+* [If-Else Statements](#if-else-statements)
+* [While Loops](#while-loops)
+* [Summary of Control Flow behavior](#summary-of-control-flow-behavior)
+* [Compile-Time Metaprogramming](#compile-time-metaprogramming)
+  + [Limitations of Dynamic Control Flow](#limitations-of-dynamic-control-flow)
+
+
+
+
+
+[![NVIDIA](../../../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg)
+![NVIDIA](../../../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg)](https://www.nvidia.com)
+
+Copyright Â© 2025-2026, NVIDIA Corporation.
+
+Last updated on Apr 08, 2026.
