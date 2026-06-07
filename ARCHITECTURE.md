@@ -43,11 +43,12 @@ The project is structured as a modular Python library with clear separation betw
         - Maps the sequence dimension directly to the grid blocks to process exactly one tile of size 64 per CTA (loopless design), achieving a 2.33x speedup over Triton on non-contiguous slices.
     - Exposes `qknorm_rope_scale_cute_op` and `qknorm_rope_scale_cute_backward_op` via `flash_attn_prologue/__init__.py`, registering them as custom PyTorch operators under `flash_prologue::qknorm_rope_scale_cute` and `flash_prologue::qknorm_rope_scale_cute_backward` with independent autotuning.
 11. **Cloned Backward GEMM Module (`flash_attn_prologue/gemm_bwd.py`):**
-    - Implements decoupled `matmul_bwd_dx` and `matmul_bwd_dw` JIT compilation and runner wrappers.
-    - Provides two isolated compilation cache routines (`_compile_gemm_bwd_dx` and `_compile_gemm_bwd_dw`) using QuACK FFI binders.
+    - Implements decoupled `matmul_bwd_dx` and `matmul_bwd_dw` JIT compilation and runner wrappers using Blackwell (SM120) hardware TMA (Tensor Memory Accelerator) loads (`CopyBulkTensorTileG2SOp`) and asynchronous `mbarrier` transaction barriers.
+    - Provides two isolated compilation cache routines (`get_matmul_bwd_dx_kernel` and `get_matmul_bwd_dw_kernel`) using QuACK FFI binders.
     - Allows independent optimization of tile size, warp layouts, pipeline stages, register allocations, and other compilation options for dx and dw computation steps.
-    - Specifically, `bwd_dx` is configured to use `ab_stage = 3` (triple-buffering) and is autotuned to select `BLOCK_M = BLOCK_N = 128, BLOCK_K = 32` with `maxrregcount = 255` (to prevent NaN/Inf register spills).
-    - `bwd_dw` is restricted to `ab_stage = 2` (double-buffering) and symmetric tile shape `BLOCK_M = BLOCK_N = 64, BLOCK_K = 32` under `Split-K = 16` to resolve correctness and read hazard issues caused by deep-stage cp.async prefetching and register layout conflicts under large dimensions.
+    - To prevent Write-After-Read (WAR) hazards and correctness bugs (such as NaNs, Infs, and huge numerical errors) inherent to smaller block layouts (like `64x64`) under high-throughput JIT execution, both `bwd_dx` and `bwd_dw` are strictly configured and autotuned to use the highly stable and correct `BLOCK_M = BLOCK_N = 128, BLOCK_K = 32` block shape with `ab_stage = 3` (triple-buffering) and `maxrregcount = 255`.
+    - `bwd_dw` additionally implements a `Split-K = 16` grid dimension to perform parallel shared memory accumulations, storing to global weight gradients via atomic additions (`cute.arch.atomic_add`) in Float32.
+
 
 
 ---

@@ -71,10 +71,9 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
     elif mode in ("bwd_dx", "bwd_dw"):
         candidates = []
         if mode == "bwd_dx":
-            # For dx, symmetric block shapes 64x64 and 128x128 are correct and performant.
-            # Avoid asymmetric block shapes to prevent layout corruption.
-            # maxrregcount = 255 is required to avoid local memory spilling for 128x128.
-            for block_size in [64, 128]:
+            # For dx, symmetric block shape 128x128 is correct and performant.
+            # Avoid asymmetric block shapes or smaller 64x64 shapes to prevent layout corruption or race conditions.
+            for block_size in [128]:
                 for bk in [32, 64]:
                     for regs in [255]:
                         candidates.append({
@@ -86,13 +85,12 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                             "maxrregcount": regs
                         })
         else: # mode == "bwd_dw"
-            # For dw, 64x64x32 is the most stable and correct configuration.
-            # Avoid larger and asymmetric block shapes under Split-K to prevent layout corruption or NaN/Inf accumulation.
+            # For dw, 128x128x32 is correct and performant under Split-K.
             candidates.append({
-                "BLOCK_M": 64,
-                "BLOCK_N": 64,
+                "BLOCK_M": 128,
+                "BLOCK_N": 128,
                 "BLOCK_K": 32,
-                "ab_stage": 2,
+                "ab_stage": 3,
                 "num_warps": 4,
                 "maxrregcount": 255
             })
@@ -185,9 +183,9 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
         elif mode == "fused":
             return {"HEAD_GROUP": 2, "BLOCK_M": 64, "BLOCK_N": 384, "BLOCK_K": 32}
         elif mode == "bwd_dx":
-            return {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "ab_stage": 3, "num_warps": 4, "maxrregcount": 255}
+            return {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "ab_stage": 3, "num_warps": 4, "maxrregcount": 255}
         elif mode == "bwd_dw":
-            return {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "ab_stage": 2, "num_warps": 4, "maxrregcount": 255}
+            return {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "ab_stage": 3, "num_warps": 4, "maxrregcount": 255}
         else:
             return {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}
         
@@ -539,9 +537,9 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
         elif mode == "fused":
             best_config = {"HEAD_GROUP": 2, "BLOCK_M": 64, "BLOCK_N": 384, "BLOCK_K": 32}
         elif mode == "bwd_dx":
-            best_config = {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "ab_stage": 3, "num_warps": 4, "maxrregcount": 255}
+            best_config = {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "ab_stage": 3, "num_warps": 4, "maxrregcount": 255}
         elif mode == "bwd_dw":
-            best_config = {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "ab_stage": 2, "num_warps": 4, "maxrregcount": 255}
+            best_config = {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "ab_stage": 3, "num_warps": 4, "maxrregcount": 255}
         else:
             best_config = {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}
         

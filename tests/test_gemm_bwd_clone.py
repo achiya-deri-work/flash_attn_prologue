@@ -37,15 +37,15 @@ def test_cloned_gemm_bwd():
     print("Compiling and running raw CuTe matmul_bwd_dx...")
     grad_x_cute = torch.ops.flash_prologue.matmul_bwd_dx_cute(grad_output, weight)
     
-    # print("Compiling and running raw CuTe matmul_bwd_dw...")
-    # grad_weight_cute = torch.ops.flash_prologue.matmul_bwd_dw_cute(grad_output.t(), x)
+    print("Compiling and running raw CuTe matmul_bwd_dw...")
+    grad_weight_cute = torch.ops.flash_prologue.matmul_bwd_dw_cute(grad_output.t(), x)
     
     # 4. Correctness Assertions
     diff_dx = (grad_x_cute - grad_x_eager).abs().max().item()
-    # diff_dw = (grad_weight_cute - grad_weight_eager).abs().max().item()
+    diff_dw = (grad_weight_cute - grad_weight_eager).abs().max().item()
     
     print(f"dx max absolute difference: {diff_dx:.6f}")
-    # print(f"dw max absolute difference: {diff_dw:.6f}")
+    print(f"dw max absolute difference: {diff_dw:.6f}")
     
     print("grad_x_cute NaNs count:", torch.isnan(grad_x_cute).sum().item())
     print("grad_x_cute Infs count:", torch.isinf(grad_x_cute).sum().item())
@@ -61,23 +61,23 @@ def test_cloned_gemm_bwd():
         print("First 10 mismatch cute values for dx:\n", grad_x_cute[dx_mismatches][:10])
         print("First 10 mismatch eager values for dx:\n", grad_x_eager[dx_mismatches][:10])
         
-    # print("grad_weight_cute NaNs count:", torch.isnan(grad_weight_cute).sum().item())
-    # print("grad_weight_cute Infs count:", torch.isinf(grad_weight_cute).sum().item())
-    # print("grad_weight_cute first 5x5 elements:\n", grad_weight_cute[:5, :5])
-    # print("grad_weight_eager first 5x5 elements:\n", grad_weight_eager[:5, :5])
+    print("grad_weight_cute NaNs count:", torch.isnan(grad_weight_cute).sum().item())
+    print("grad_weight_cute Infs count:", torch.isinf(grad_weight_cute).sum().item())
+    print("grad_weight_cute first 5x5 elements:\n", grad_weight_cute[:5, :5])
+    print("grad_weight_eager first 5x5 elements:\n", grad_weight_eager[:5, :5])
     
     # Check which elements are different for dw
-    # mismatches = (grad_weight_cute - grad_weight_eager).abs() > 0.3
-    # mismatch_indices = torch.nonzero(mismatches)
-    # print("Number of mismatching elements for dw:", mismatch_indices.shape[0])
-    # if mismatch_indices.shape[0] > 0:
-    #     print("First 10 mismatch indices for dw:\n", mismatch_indices[:10])
-    #     print("First 10 mismatch cute values for dw:\n", grad_weight_cute[mismatches][:10])
-    #     print("First 10 mismatch eager values for dw:\n", grad_weight_eager[mismatches][:10])
+    mismatches = (grad_weight_cute - grad_weight_eager).abs() > 0.3
+    mismatch_indices = torch.nonzero(mismatches)
+    print("Number of mismatching elements for dw:", mismatch_indices.shape[0])
+    if mismatch_indices.shape[0] > 0:
+        print("First 10 mismatch indices for dw:\n", mismatch_indices[:10])
+        print("First 10 mismatch cute values for dw:\n", grad_weight_cute[mismatches][:10])
+        print("First 10 mismatch eager values for dw:\n", grad_weight_eager[mismatches][:10])
     
     # Precision-Aware Tolerances for bfloat16 (atol=1e-1, rtol=1e-2)
     torch.testing.assert_close(grad_x_cute, grad_x_eager, atol=1e-1, rtol=1e-2, msg="Cloned matmul_bwd_dx mismatch")
-    # torch.testing.assert_close(grad_weight_cute, grad_weight_eager, atol=0.3, rtol=1e-2, msg="Cloned matmul_bwd_dw mismatch")
+    torch.testing.assert_close(grad_weight_cute, grad_weight_eager, atol=0.3, rtol=1e-2, msg="Cloned matmul_bwd_dw mismatch")
     
     print("SUCCESS: Cloned raw CuTe backward kernels match PyTorch eager outputs perfectly!")
 
@@ -100,18 +100,18 @@ def test_cloned_gemm_bwd():
     cute_dx_time = (time.perf_counter() - start) * 1000 / 100
     
     # Eager dw
-    # start = time.perf_counter()
-    # for _ in range(100):
-    #     _ = grad_output.t() @ x
-    # torch.cuda.synchronize()
-    # eager_dw_time = (time.perf_counter() - start) * 1000 / 100
+    start = time.perf_counter()
+    for _ in range(100):
+        _ = grad_output.t() @ x
+    torch.cuda.synchronize()
+    eager_dw_time = (time.perf_counter() - start) * 1000 / 100
     
     # CuTe dw
-    # start = time.perf_counter()
-    # for _ in range(100):
-    #     _ = torch.ops.flash_prologue.matmul_bwd_dw_cute(grad_output.t(), x)
-    # torch.cuda.synchronize()
-    # cute_dw_time = (time.perf_counter() - start) * 1000 / 100
+    start = time.perf_counter()
+    for _ in range(100):
+        _ = torch.ops.flash_prologue.matmul_bwd_dw_cute(grad_output.t(), x)
+    torch.cuda.synchronize()
+    cute_dw_time = (time.perf_counter() - start) * 1000 / 100
     
     print(f"Eager dx: {eager_dx_time:.4f} ms | CuTe dx: {cute_dx_time:.4f} ms")
     print(f"Eager dw: {eager_dw_time:.4f} ms | CuTe dw: {cute_dw_time:.4f} ms")

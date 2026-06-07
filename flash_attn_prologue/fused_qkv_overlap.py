@@ -12,6 +12,7 @@ from cutlass.cute.nvgpu.warp import MmaF16BF16Op
 from cutlass import BFloat16, Float32, Int32, Int64, Boolean, const_expr
 from cutlass.cute.nvgpu import cpasync
 from quack.compile_utils import make_fake_tensor
+from quack import copy_utils
 
 class FusedQKVOverlap:
     def __init__(self, num_warps: int = 4, BLOCK_M: int = 64, BLOCK_K_STAGE: int = 32, NUM_HEADS: int = 16, HEAD_DIM: int = 64, HEAD_GROUP: int = 2, hidden: int = 512, use_sync_in_loop: bool = True, ab_stage: int = None):
@@ -47,9 +48,11 @@ class FusedQKVOverlap:
             (self.BLOCK_M, self.BLOCK_K_STAGE, self.ab_stage),
             stride=(self.BLOCK_K_STAGE, 1, self.BLOCK_M * self.BLOCK_K_STAGE)
         )
+        # Physical layout of sW: non-interleaved grouped layout
+        # (3 components: Q, K, V are stored contiguously in SMEM)
         self.b_smem_layout_staged = cute.make_layout(
-            (self.BLOCK_N, self.BLOCK_K_STAGE, self.ab_stage),
-            stride=(self.BLOCK_K_STAGE, 1, self.BLOCK_N * self.BLOCK_K_STAGE)
+            ((self.HEAD_DIM, 3, self.HEAD_GROUP), self.BLOCK_K_STAGE, self.ab_stage),
+            stride=((self.BLOCK_K_STAGE, self.HEAD_GROUP * self.HEAD_DIM * self.BLOCK_K_STAGE, self.HEAD_DIM * self.BLOCK_K_STAGE), 1, self.BLOCK_N * self.BLOCK_K_STAGE)
         )
         
         # Shared memory layout for epilogue writeback (Float32 view of sBuf)
@@ -85,33 +88,8 @@ class FusedQKVOverlap:
         # 4. Copy atom for Float32 accumulator writeback
         copy_op_r2s = cute.nvgpu.CopyUniversalOp()
         self.copy_atom_r2s = cute.make_copy_atom(copy_op_r2s, Float32)
- 
-        # 5. TiledCopy configurations using cp.async (cooperative, tiled for all 128 threads)
-        copy_op = cute.nvgpu.cpasync.CopyG2SOp()
-        copy_atom = cute.make_copy_atom(copy_op, BFloat16, num_bits_per_copy=128)
         
-        # For X (shape: BLOCK_M x BLOCK_K_STAGE)
-        copy_x_val_k = min(8, self.BLOCK_K_STAGE)
-        copy_x_thr_k = self.BLOCK_K_STAGE // copy_x_val_k
-        copy_x_thr_m = min((self.num_warps * 32) // copy_x_thr_k, self.BLOCK_M)
-        self.copy_x_threads = copy_x_thr_m * copy_x_thr_k
-        self.gmem_tiled_copy_x = cute.make_tiled_copy_tv(
-            copy_atom,
-            cute.make_ordered_layout((copy_x_thr_m, copy_x_thr_k), order=(1, 0)),
-            cute.make_layout((1, copy_x_val_k))
-        )
-        
-        # For W (shape: BLOCK_N x BLOCK_K_STAGE)
-        copy_w_val_k = min(8, self.BLOCK_K_STAGE)
-        copy_w_thr_k = self.BLOCK_K_STAGE // copy_w_val_k
-        copy_w_thr_n = min((self.num_warps * 32) // copy_w_thr_k, self.BLOCK_N)
-        self.copy_w_threads = copy_w_thr_n * copy_w_thr_k
-        self.gmem_tiled_copy_w = cute.make_tiled_copy_tv(
-            copy_atom,
-            cute.make_ordered_layout((copy_w_thr_n, copy_w_thr_k), order=(1, 0)),
-            cute.make_layout((1, copy_w_val_k))
-        )
-        
+        # 5. TiledCopy configuration for direct-store epilogue
         store_op = cute.nvgpu.CopyUniversalOp()
         store_atom = cute.make_copy_atom(store_op, BFloat16, num_bits_per_copy=128)
         store_thr_m = min(16, self.BLOCK_M)
@@ -126,7 +104,9 @@ class FusedQKVOverlap:
     def __call__(
         self,
         x: cute.Tensor,
-        weight: cute.Tensor,
+        weight_q: cute.Tensor,
+        weight_k: cute.Tensor,
+        weight_v: cute.Tensor,
         q_proj: cute.Tensor,
         k_proj: cute.Tensor,
         v_proj: cute.Tensor,
@@ -139,21 +119,65 @@ class FusedQKVOverlap:
         
         num_threads = self.num_warps * 32
         
+        # 1. Create global layouts and tensors for TMA
+        gX = cute.make_tensor(x.iterator, cute.make_layout((B * N, self.hidden), stride=(self.hidden, 1)))
+        
+        num_heads_x_dim = self.NUM_HEADS * self.HEAD_DIM
+        gW_q = cute.make_tensor(weight_q.iterator, cute.make_layout((num_heads_x_dim, self.hidden), stride=(self.hidden, 1)))
+        gW_k = cute.make_tensor(weight_k.iterator, cute.make_layout((num_heads_x_dim, self.hidden), stride=(self.hidden, 1)))
+        gW_v = cute.make_tensor(weight_v.iterator, cute.make_layout((num_heads_x_dim, self.hidden), stride=(self.hidden, 1)))
+        
+        # 2. Make TMA load descriptors (atoms/tensors)
+        tma_load_op = cpasync.CopyBulkTensorTileG2SOp()
+        
+        tma_atom_x, tma_tensor_x = cpasync.make_tiled_tma_atom(
+            tma_load_op,
+            gX,
+            cute.make_layout((self.BLOCK_M, self.BLOCK_K_STAGE), stride=(self.BLOCK_K_STAGE, 1)),
+            (self.BLOCK_M, self.BLOCK_K_STAGE)
+        )
+        
+        # Staged SMEM layout for one component of W: shape (HEAD_GROUP * HEAD_DIM, BLOCK_K_STAGE)
+        smem_layout_w_comp = cute.make_layout((self.HEAD_GROUP * self.HEAD_DIM, self.BLOCK_K_STAGE), stride=(self.BLOCK_K_STAGE, 1))
+        
+        tma_atom_wq, tma_tensor_wq = cpasync.make_tiled_tma_atom(
+            tma_load_op,
+            gW_q,
+            smem_layout_w_comp,
+            (self.HEAD_GROUP * self.HEAD_DIM, self.BLOCK_K_STAGE)
+        )
+        
+        tma_atom_wk, tma_tensor_wk = cpasync.make_tiled_tma_atom(
+            tma_load_op,
+            gW_k,
+            smem_layout_w_comp,
+            (self.HEAD_GROUP * self.HEAD_DIM, self.BLOCK_K_STAGE)
+        )
+        
+        tma_atom_wv, tma_tensor_wv = cpasync.make_tiled_tma_atom(
+            tma_load_op,
+            gW_v,
+            smem_layout_w_comp,
+            (self.HEAD_GROUP * self.HEAD_DIM, self.BLOCK_K_STAGE)
+        )
+        
         swizzle_x = 8
         grid_x_blocks = cute.ceil_div(N, self.BLOCK_M)
         swizzled_grid_x = cute.ceil_div(grid_x_blocks, swizzle_x) * swizzle_x
         
         self.kernel(
-            x, weight,
+            x, weight_q, weight_k, weight_v,
             q_proj, k_proj, v_proj,
             self.tiled_mma,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
             self.epi_smem_layout,
             self.copy_atom_r2s,
-            self.gmem_tiled_copy_x,
-            self.gmem_tiled_copy_w,
             self.gmem_tiled_copy_store,
+            tma_atom_x, tma_tensor_x,
+            tma_atom_wq, tma_tensor_wq,
+            tma_atom_wk, tma_tensor_wk,
+            tma_atom_wv, tma_tensor_wv,
             Boolean(self.use_sync_in_loop)
         ).launch(
             grid=[swizzled_grid_x, B, self.NUM_HEADS // self.HEAD_GROUP],
@@ -165,7 +189,9 @@ class FusedQKVOverlap:
     def kernel(
         self,
         x: cute.Tensor,
-        weight: cute.Tensor,
+        weight_q: cute.Tensor,
+        weight_k: cute.Tensor,
+        weight_v: cute.Tensor,
         q_proj: cute.Tensor,
         k_proj: cute.Tensor,
         v_proj: cute.Tensor,
@@ -174,9 +200,15 @@ class FusedQKVOverlap:
         b_smem_layout: cute.Layout,
         epi_smem_layout: cute.Layout,
         copy_atom_r2s: cute.CopyAtom,
-        gmem_tiled_copy_x: cute.TiledCopy,
-        gmem_tiled_copy_w: cute.TiledCopy,
         gmem_tiled_copy_store: cute.TiledCopy,
+        tma_atom_x: cute.CopyAtom,
+        tma_tensor_x: cute.Tensor,
+        tma_atom_wq: cute.CopyAtom,
+        tma_tensor_wq: cute.Tensor,
+        tma_atom_wk: cute.CopyAtom,
+        tma_tensor_wk: cute.Tensor,
+        tma_atom_wv: cute.CopyAtom,
+        tma_tensor_wv: cute.Tensor,
         use_sync_in_loop: Boolean
     ):
         grid_dim_x = cute.arch.grid_dim()[0]
@@ -204,6 +236,13 @@ class FusedQKVOverlap:
         
         tidx, _, _ = cute.arch.thread_idx()
         
+        # Prefetch TMA descriptors on thread 0
+        if tidx == 0:
+            cpasync.prefetch_descriptor(tma_atom_x)
+            cpasync.prefetch_descriptor(tma_atom_wq)
+            cpasync.prefetch_descriptor(tma_atom_wk)
+            cpasync.prefetch_descriptor(tma_atom_wv)
+            
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         
@@ -215,11 +254,63 @@ class FusedQKVOverlap:
         hidden = x.shape[2]
         k_tile_cnt = hidden // self.BLOCK_K_STAGE
         
-        # Thread slice of sW layout
-        sW_sub_layout = cute.make_layout(
-            ((self.HEAD_DIM, 3, self.HEAD_GROUP), self.BLOCK_K_STAGE),
-            stride=((self.BLOCK_K_STAGE, self.HEAD_DIM * self.BLOCK_K_STAGE, 3 * self.HEAD_DIM * self.BLOCK_K_STAGE), 1)
+        # Partition global tensors inside the kernel using local_tile and tma_get_copy_fn
+        N_blocks = cute.ceil_div(N, self.BLOCK_M)
+        gX_tile = cute.local_tile(tma_tensor_x, (self.BLOCK_M, self.BLOCK_K_STAGE), (cta_b * N_blocks + cta_m, None))
+        copy_X, _, _ = copy_utils.tma_get_copy_fn(
+            tma_atom_x,
+            cta_coord=0,
+            cta_layout=cute.make_layout(1),
+            src_tensor=gX_tile,
+            dst_tensor=sX_aligned,
+            single_stage=False
         )
+        
+        gW_q_tile = cute.local_tile(tma_tensor_wq, (self.HEAD_GROUP * self.HEAD_DIM, self.BLOCK_K_STAGE), (cta_h_group, None))
+        gW_k_tile = cute.local_tile(tma_tensor_wk, (self.HEAD_GROUP * self.HEAD_DIM, self.BLOCK_K_STAGE), (cta_h_group, None))
+        gW_v_tile = cute.local_tile(tma_tensor_wv, (self.HEAD_GROUP * self.HEAD_DIM, self.BLOCK_K_STAGE), (cta_h_group, None))
+        
+        comp_size = self.HEAD_GROUP * self.HEAD_DIM * self.BLOCK_K_STAGE
+        sW_q_layout = cute.make_layout(
+            (self.HEAD_GROUP * self.HEAD_DIM, self.BLOCK_K_STAGE, self.ab_stage),
+            stride=(self.BLOCK_K_STAGE, 1, self.BLOCK_N * self.BLOCK_K_STAGE)
+        )
+        sW_q_aligned = cute.make_tensor(sW_aligned.iterator, sW_q_layout)
+        sW_k_aligned = cute.make_tensor(sW_aligned.iterator + comp_size, sW_q_layout)
+        sW_v_aligned = cute.make_tensor(sW_aligned.iterator + 2 * comp_size, sW_q_layout)
+        
+        copy_W_q, _, _ = copy_utils.tma_get_copy_fn(
+            tma_atom_wq,
+            cta_coord=0,
+            cta_layout=cute.make_layout(1),
+            src_tensor=gW_q_tile,
+            dst_tensor=sW_q_aligned,
+            single_stage=False
+        )
+        copy_W_k, _, _ = copy_utils.tma_get_copy_fn(
+            tma_atom_wk,
+            cta_coord=0,
+            cta_layout=cute.make_layout(1),
+            src_tensor=gW_k_tile,
+            dst_tensor=sW_k_aligned,
+            single_stage=False
+        )
+        copy_W_v, _, _ = copy_utils.tma_get_copy_fn(
+            tma_atom_wv,
+            cta_coord=0,
+            cta_layout=cute.make_layout(1),
+            src_tensor=gW_v_tile,
+            dst_tensor=sW_v_aligned,
+            single_stage=False
+        )
+        
+        mbar_ptr = cute.arch.alloc_smem(Int64, self.ab_stage)
+        if tidx == 0:
+            for s in cutlass.range_constexpr(self.ab_stage):
+                cute.arch.mbarrier_init(mbar_ptr + s, 1)
+            cute.arch.mbarrier_init_fence()
+            
+        cute.arch.sync_threads()
         
         thr_mma = tiled_mma.get_slice(tidx)
         
@@ -246,47 +337,22 @@ class FusedQKVOverlap:
         global_h = self.HEAD_GROUP * cta_h_group + h_local
         seq = cta_m * self.BLOCK_M + r
         
-        # Layouts for global reads
-        gX_layout = cute.make_layout((self.BLOCK_M, self.BLOCK_K_STAGE), stride=(hidden, 1))
-        gW_layout = cute.make_layout(
-            ((self.HEAD_DIM, 3, self.HEAD_GROUP), self.BLOCK_K_STAGE),
-            stride=((self.hidden, self.NUM_HEADS * self.HEAD_DIM * self.hidden, self.HEAD_DIM * self.hidden), 1)
-        )
-        
         # Prefetch initial stages (up to self.ab_stage - 1)
         for stage in cutlass.range_constexpr(self.ab_stage - 1):
             if stage < k_tile_cnt:
-                k_offset_init = stage * self.BLOCK_K_STAGE
-                
-                # Load X
-                if tidx < self.copy_x_threads:
-                    thr_copy_x = gmem_tiled_copy_x.get_slice(tidx)
-                    tSsX_stage = thr_copy_x.partition_D(sX_aligned)
-                    x_ptr_init = (x[cta_b, cta_m * self.BLOCK_M, None].iterator + k_offset_init).align(16)
-                    gX_init = cute.make_tensor(x_ptr_init, gX_layout)
-                    tSgX_init = thr_copy_x.partition_S(gX_init)
-                    cute.copy(gmem_tiled_copy_x, tSgX_init, tSsX_stage[None, None, None, stage])
-                
-                # Load W: Q, K, V weights for current head group contiguously
-                if tidx < self.copy_w_threads:
-                    thr_copy_w = gmem_tiled_copy_w.get_slice(tidx)
-                    sW_ptr_init = sW_aligned.iterator + stage * (self.BLOCK_N * self.BLOCK_K_STAGE)
-                    sW_write_init = cute.make_tensor(sW_ptr_init.align(16), sW_sub_layout)
-                    tSsW_init = thr_copy_w.partition_D(sW_write_init)
-                    
-                    weight_ptr_init = (weight.iterator + (cta_h_group * self.HEAD_GROUP * self.HEAD_DIM) * self.hidden + k_offset_init).align(16)
-                    gW_init = cute.make_tensor(weight_ptr_init, gW_layout)
-                    tSgW_init = thr_copy_w.partition_S(gW_init)
-                    cute.copy(gmem_tiled_copy_w, tSgW_init, tSsW_init)
-                
-                cute.arch.cp_async_commit_group()
+                if tidx < 32:
+                    if tidx == 0:
+                        tx_bytes = (self.BLOCK_M * self.BLOCK_K_STAGE * 2) + (self.BLOCK_N * self.BLOCK_K_STAGE * 2)
+                        cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr + stage, tx_bytes)
+                    cute.arch.sync_warp()
+                    copy_X(stage, stage, tma_bar_ptr=mbar_ptr + stage)
+                    copy_W_q(stage, stage, tma_bar_ptr=mbar_ptr + stage)
+                    copy_W_k(stage, stage, tma_bar_ptr=mbar_ptr + stage)
+                    copy_W_v(stage, stage, tma_bar_ptr=mbar_ptr + stage)
                 
         # Wait for the first stage (stage 0) to be ready in shared memory and prefetch it to rA_0/rB_0 (vectorized)
         if k_tile_cnt > 0:
-            if self.ab_stage - 1 < k_tile_cnt:
-                cute.arch.cp_async_wait_group(self.ab_stage - 2)
-            else:
-                cute.arch.cp_async_wait_group(0)
+            cute.arch.mbarrier_wait(mbar_ptr + 0, 0)
             cute.arch.sync_threads()
             
             tCsA_init = tCsX[None, None, None, 0]
@@ -299,40 +365,23 @@ class FusedQKVOverlap:
             pipe_read = k_tile % self.ab_stage
             pipe_write = (k_tile + self.ab_stage - 1) % self.ab_stage
             next_pipe_read = (k_tile + 1) % self.ab_stage
-
+ 
             next_gmem_read = k_tile + (self.ab_stage - 1)
             if next_gmem_read < k_tile_cnt:
-                k_offset_loop = next_gmem_read * self.BLOCK_K_STAGE
-                
-                # Load X
-                if tidx < self.copy_x_threads:
-                    thr_copy_x = gmem_tiled_copy_x.get_slice(tidx)
-                    tSsX_stage = thr_copy_x.partition_D(sX_aligned)
-                    x_ptr_loop = (x[cta_b, cta_m * self.BLOCK_M, None].iterator + k_offset_loop).align(16)
-                    gX_loop = cute.make_tensor(x_ptr_loop, gX_layout)
-                    tSgX_loop = thr_copy_x.partition_S(gX_loop)
-                    cute.copy(gmem_tiled_copy_x, tSgX_loop, tSsX_stage[None, None, None, pipe_write])
-                
-                # Load W
-                if tidx < self.copy_w_threads:
-                    thr_copy_w = gmem_tiled_copy_w.get_slice(tidx)
-                    sW_ptr_loop = sW_aligned.iterator + pipe_write * (self.BLOCK_N * self.BLOCK_K_STAGE)
-                    sW_write_loop = cute.make_tensor(sW_ptr_loop.align(16), sW_sub_layout)
-                    tSsW_loop = thr_copy_w.partition_D(sW_write_loop)
-                    
-                    weight_ptr_loop = (weight.iterator + (cta_h_group * self.HEAD_GROUP * self.HEAD_DIM) * self.hidden + k_offset_loop).align(16)
-                    gW_loop = cute.make_tensor(weight_ptr_loop, gW_layout)
-                    tSgW_loop = thr_copy_w.partition_S(gW_loop)
-                    cute.copy(gmem_tiled_copy_w, tSgW_loop, tSsW_loop)
-
-                cute.arch.cp_async_commit_group()
+                if tidx < 32:
+                    if tidx == 0:
+                        tx_bytes = (self.BLOCK_M * self.BLOCK_K_STAGE * 2) + (self.BLOCK_N * self.BLOCK_K_STAGE * 2)
+                        cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr + pipe_write, tx_bytes)
+                    cute.arch.sync_warp()
+                    copy_X(next_gmem_read, pipe_write, tma_bar_ptr=mbar_ptr + pipe_write)
+                    copy_W_q(next_gmem_read, pipe_write, tma_bar_ptr=mbar_ptr + pipe_write)
+                    copy_W_k(next_gmem_read, pipe_write, tma_bar_ptr=mbar_ptr + pipe_write)
+                    copy_W_v(next_gmem_read, pipe_write, tma_bar_ptr=mbar_ptr + pipe_write)
                 
             # Prefetch next stage's registers
             if k_tile + 1 < k_tile_cnt:
-                if next_gmem_read < k_tile_cnt:
-                    cute.arch.cp_async_wait_group(self.ab_stage - 2)
-                else:
-                    cute.arch.cp_async_wait_group(0)
+                next_phase = ((k_tile + 1) // self.ab_stage) % 2
+                cute.arch.mbarrier_wait(mbar_ptr + next_pipe_read, next_phase)
                 if use_sync_in_loop:
                     cute.arch.sync_threads()
                 
@@ -473,7 +522,9 @@ def get_fused_qkv_overlap_kernel(num_warps=4, BLOCK_M=64, BLOCK_K_STAGE=32, NUM_
         )
         
         x_fake = make_fake_tensor(BFloat16, (B_sym, N_sym, hidden), 16)
-        weight_fake = make_fake_tensor(BFloat16, (3 * NUM_HEADS * HEAD_DIM, hidden), 16)
+        weight_q_fake = make_fake_tensor(BFloat16, (NUM_HEADS * HEAD_DIM, hidden), 16)
+        weight_k_fake = make_fake_tensor(BFloat16, (NUM_HEADS * HEAD_DIM, hidden), 16)
+        weight_v_fake = make_fake_tensor(BFloat16, (NUM_HEADS * HEAD_DIM, hidden), 16)
         
         q_proj_fake = make_fake_tensor(BFloat16, (B_sym, NUM_HEADS, N_sym, HEAD_DIM), 16)
         k_proj_fake = make_fake_tensor(BFloat16, (B_sym, NUM_HEADS, N_sym, HEAD_DIM), 16)
@@ -483,7 +534,7 @@ def get_fused_qkv_overlap_kernel(num_warps=4, BLOCK_M=64, BLOCK_K_STAGE=32, NUM_
         
         compiled_fwd = cute.compile(
             fwd_op,
-            x_fake, weight_fake,
+            x_fake, weight_q_fake, weight_k_fake, weight_v_fake,
             q_proj_fake, k_proj_fake, v_proj_fake,
             fake_stream,
             options=f"--enable-tvm-ffi --opt-level 3 --ptxas-options '-O3 -v --maxrregcount={maxrregcount}'",
@@ -528,8 +579,13 @@ def fused_qkv_overlap_op(
         maxrregcount=maxrregcount
     )
     
+    num_heads_x_dim = num_heads * head_dim
+    weight_q = weight[0 : num_heads_x_dim, :]
+    weight_k = weight[num_heads_x_dim : 2 * num_heads_x_dim, :]
+    weight_v = weight[2 * num_heads_x_dim : 3 * num_heads_x_dim, :]
+    
     fwd_kernel(
-        x, weight,
+        x, weight_q, weight_k, weight_v,
         q_proj_bf16, k_proj_bf16, v_proj_bf16
     )
     

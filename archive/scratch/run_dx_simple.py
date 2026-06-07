@@ -11,8 +11,8 @@ def main():
     print("Compiling get_matmul_bwd_dx_kernel...")
     kernel = get_matmul_bwd_dx_kernel(
         num_warps=4,
-        BLOCK_M=128,
-        BLOCK_N=128,
+        BLOCK_M=64,
+        BLOCK_N=64,
         BLOCK_K_STAGE=32,
         ab_stage=3,
         K_dim=3072,
@@ -30,6 +30,11 @@ def main():
     kernel(grad_output, weight, grad_x)
     torch.cuda.synchronize()
     print("Execution completed successfully!")
+    
+    grad_x_eager = grad_output @ weight
+    diff = (grad_x - grad_x_eager).abs().max().item()
+    print(f"Max absolute difference: {diff:.6f}")
+    print(f"NaNs count: {torch.isnan(grad_x).sum().item()}")
 
 if __name__ == "__main__":
     main()

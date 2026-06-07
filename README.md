@@ -11,7 +11,7 @@ This project contains a high-performance custom CUDA kernel implementation for a
 - **Split-N Optimization:** A specialized cooperatively partitioned threadblock design (`fused_qkv_cute_splitn`) targeting consumer Blackwell platforms (`sm_120a`) to avoid TMEM hardware requirements.
 - Triton Standalone Epilogue: A standalone Triton kernel (`qknorm_rope_scale`) fusing epilogue operations after a standard PyTorch linear layer.
 - **CuTe Standalone Epilogue:** High-performance, layout-agnostic standalone forward and backward CuTe epilogue operators (`qknorm_rope_scale_cute_op` / `qknorm_rope_scale_cute_backward_op`) that mutate separate Q/K tensors in-place, specialize on strides at JIT compile time to eliminate `.contiguous()` conversions, and run up to 2.33x faster than Triton.
-- **Pipelined cp.async GEMM Kernel:** An optimized 3-stage pipelined GEMM kernel (`pipelined_gemm_cute_op`) utilizing `cp.async` copy groups for memory latency overlap instead of TMA.
+- **Blackwell TMA-based Backward GEMM Kernels:** Features high-performance JIT-compiled backward GEMM kernels (`matmul_bwd_dx` and `matmul_bwd_dw`) utilizing hardware TMA loads and asynchronous `mbarrier` transaction barriers on SM120.
 - **torch.compile Integration:** Fully compatible with `torch.compile` via custom PyTorch operator registration and custom schema definitions.
 
 ## Installation
@@ -63,7 +63,7 @@ Verify the resource-optimized Fused QKV Overlap kernel:
 PYTHONPATH=. CUTE_DSL_LIBS=/home/achiya/vs_code_main/flash_attn_prologue/.venv/lib/python3.13/site-packages/nvidia_cutlass_dsl/lib/libcute_dsl_runtime.so .venv/bin/python tests/test_fused_qkv_overlap.py
 ```
 
-Verify the cloned and adapted backward GEMM kernels (matmul_bwd_dx and matmul_bwd_dw):
+Verify the cloned and adapted TMA-based backward GEMM kernels (`matmul_bwd_dx` and `matmul_bwd_dw`):
 ```bash
-PYTHONPATH=./quack:. CUTE_DSL_LIBS=/home/achiya/vs_code_main/flash_attn_prologue/.venv/lib/python3.13/site-packages/nvidia_cutlass_dsl/lib/libcute_dsl_runtime.so .venv/bin/python tests/test_gemm_bwd_clone.py
+PYTHONPATH=. CUTE_DSL_LIBS=/home/achiya/vs_code_main/flash_attn_prologue/.venv/lib/python3.13/site-packages/nvidia_cutlass_dsl/lib/libcute_dsl_runtime.so .venv/bin/pytest tests/test_gemm_bwd_clone.py
 ```
