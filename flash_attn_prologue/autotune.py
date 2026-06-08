@@ -478,12 +478,16 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                     
                 B_prof = 32
                 N_seq_prof = 512
+                split_k = config.get("SPLIT_K", 1)
                 
                 grad_q_prof = torch.randn(B_prof, 16, N_seq_prof, 64, device=device, dtype=torch.bfloat16)
                 grad_k_prof = torch.randn(B_prof, 16, N_seq_prof, 64, device=device, dtype=torch.bfloat16)
                 grad_v_prof = torch.randn(B_prof, 16, N_seq_prof, 64, device=device, dtype=torch.bfloat16)
                 x_prof = torch.randn(prof_K, prof_N, device=device, dtype=torch.bfloat16)
-                grad_weight_prof = torch.zeros(prof_M, prof_N, device=device, dtype=torch.float32)
+                if split_k > 1:
+                    grad_weight_prof = torch.empty(split_k, prof_M, prof_N, device=device, dtype=torch.float32)
+                else:
+                    grad_weight_prof = torch.empty(prof_M, prof_N, device=device, dtype=torch.float32)
                 
                 dw_kernel = get_matmul_bwd_dw_kernel(
                     num_warps=warps,
@@ -500,18 +504,20 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                     k_strides=grad_k_prof.stride(),
                     v_strides=grad_v_prof.stride(),
                     maxrregcount=regs,
-                    SPLIT_K=config.get("SPLIT_K", 1)
+                    SPLIT_K=split_k
                 )
                 
+                grad_weight_prof_passed = grad_weight_prof.view(split_k * prof_M, prof_N) if split_k > 1 else grad_weight_prof
+                
                 for _ in range(3):
-                    dw_kernel(grad_q_prof, grad_k_prof, grad_v_prof, x_prof, grad_weight_prof)
+                    dw_kernel(grad_q_prof, grad_k_prof, grad_v_prof, x_prof, grad_weight_prof_passed)
                 torch.cuda.synchronize()
                 
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
                 start_event.record()
                 for _ in range(15):
-                    dw_kernel(grad_q_prof, grad_k_prof, grad_v_prof, x_prof, grad_weight_prof)
+                    dw_kernel(grad_q_prof, grad_k_prof, grad_v_prof, x_prof, grad_weight_prof_passed)
                 end_event.record()
                 torch.cuda.synchronize()
                 curr_ms = start_event.elapsed_time(end_event) / 15.0

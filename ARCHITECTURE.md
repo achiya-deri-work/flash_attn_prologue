@@ -46,7 +46,7 @@ The project is structured as a modular Python library with clear separation betw
     - Implements decoupled `matmul_bwd_dx` and `matmul_bwd_dw` JIT compilation and runner wrappers using Blackwell (SM120) hardware TMA (Tensor Memory Accelerator) loads (`CopyBulkTensorTileG2SOp`) and asynchronous `mbarrier` transaction barriers.
     - Provides two isolated compilation cache routines (`get_matmul_bwd_dx_kernel` and `get_matmul_bwd_dw_kernel`) using QuACK FFI binders.
     - Specializes the JIT compilation cache with static dimensions `B = 32` and `N = 512` to enable compile-time optimization of sequence index division/modulo operations on the GPU (converting costly dynamic division instructions into 1-cycle bit-shifts and mask operations).
-    - Optimizes the `bwd_dw` epilogue writeback: supports both direct coalesced global stores (`SPLIT_K = 1`) and parallel atomic additions (`SPLIT_K > 1`) across Split-K threadblock slices.
+    - Optimizes the `bwd_dw` epilogue writeback: supports direct coalesced global stores to the target output matrix (`SPLIT_K = 1`) or to a temporary 3D workspace slice (`SPLIT_K > 1`) followed by a second-pass sum reduction to eliminate atomic addition contention.
     - Integrates the autotuner to independently profile `bwd_dx` and `bwd_dw` using 4D split gradient tensors. The autotuner dynamically selects and caches the optimal configurations: `BLOCK_M = 128, BLOCK_N = 128, BLOCK_K = 32, ab_stage = 3` (triple-buffering) for `bwd_dx` to prevent WAR race conditions and NaNs, and `BLOCK_M = 64, BLOCK_N = 64, BLOCK_K = 32, ab_stage = 3` with `SPLIT_K = 8` for `bwd_dw` to maximize parallel execution occupancy and speed.
 
 

@@ -976,10 +976,12 @@ class GemmBwdDwCute:
                 curr_col = cta_n * self.BLOCK_N + t_col
                 if curr_row < M_dim and curr_col < N_dim:
                     val = smem_accum[row_start + r_idx, t_col]
-                    g_ptr = grad_weight.iterator + curr_row * N_dim + curr_col
                     if self.SPLIT_K > 1:
-                        cute.arch.atomic_add(g_ptr, val)
+                        offset = block_idx_z * M_dim * N_dim + curr_row * N_dim + curr_col
+                        g_ptr = grad_weight.iterator + offset
+                        g_ptr[0] = val
                     else:
+                        g_ptr = grad_weight.iterator + curr_row * N_dim + curr_col
                         g_ptr[0] = val
 
 
@@ -1055,7 +1057,10 @@ def get_matmul_bwd_dw_kernel(num_warps=4, BLOCK_M=64, BLOCK_N=64, BLOCK_K_STAGE=
         grad_k_fake = make_fake_tensor(BFloat16, (B, NUM_HEADS, N, HEAD_DIM), 16)
         grad_v_fake = make_fake_tensor(BFloat16, (B, NUM_HEADS, N, HEAD_DIM), 16)
         x_fake = make_fake_tensor(BFloat16, (K_dim, N_dim), 16)
-        grad_weight_fake = make_fake_tensor(Float32, (M_dim, N_dim), 16)
+        if SPLIT_K > 1:
+            grad_weight_fake = make_fake_tensor(Float32, (SPLIT_K * M_dim, N_dim), 16)
+        else:
+            grad_weight_fake = make_fake_tensor(Float32, (M_dim, N_dim), 16)
         
         fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         
@@ -1143,9 +1148,6 @@ def matmul_bwd_dw(
     
     x_flat = x.reshape(K_dim, N_dim).to(torch.bfloat16).contiguous()
     
-    # Initialize output tensor as Float32 zeros for Split-K atomic accumulations
-    grad_weight = torch.zeros((M_dim, N_dim), dtype=torch.float32, device=grad_q.device)
-    
     from flash_attn_prologue.autotune import get_autotuned_config
     config = get_autotuned_config(M_dim, N_dim, K_dim, "bwd_dw", device=str(grad_q.device))
     
@@ -1178,7 +1180,14 @@ def matmul_bwd_dw(
         SPLIT_K=split_k
     )
     
-    kernel(grad_q_bf16, grad_k_bf16, grad_v_bf16, x_flat, grad_weight)
+    if split_k > 1:
+        workspace = torch.empty((split_k, M_dim, N_dim), dtype=torch.float32, device=grad_q.device)
+        kernel(grad_q_bf16, grad_k_bf16, grad_v_bf16, x_flat, workspace.view(split_k * M_dim, N_dim))
+        grad_weight = workspace.sum(dim=0)
+    else:
+        grad_weight = torch.empty((M_dim, N_dim), dtype=torch.float32, device=grad_q.device)
+        kernel(grad_q_bf16, grad_k_bf16, grad_v_bf16, x_flat, grad_weight)
+        
     return grad_weight.to(torch.bfloat16)
 
 @matmul_bwd_dw.register_fake
