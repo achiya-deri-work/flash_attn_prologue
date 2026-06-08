@@ -42,12 +42,12 @@ The project is structured as a modular Python library with clear separation betw
     - Padded shared memory strides and block-level validation filters to eliminate LDS bank conflicts and redundant computations on grid padding blocks.
         - Maps the sequence dimension directly to the grid blocks to process exactly one tile of size 64 per CTA (loopless design), achieving a 2.33x speedup over Triton on non-contiguous slices.
     - Exposes `qknorm_rope_scale_cute_op` and `qknorm_rope_scale_cute_backward_op` via `flash_attn_prologue/__init__.py`, registering them as custom PyTorch operators under `flash_prologue::qknorm_rope_scale_cute` and `flash_prologue::qknorm_rope_scale_cute_backward` with independent autotuning.
-11. **Cloned Backward GEMM Module (`flash_attn_prologue/gemm_bwd.py`):**
+ 11. **Cloned Backward GEMM Module (`flash_attn_prologue/gemm_bwd.py`):**
     - Implements decoupled `matmul_bwd_dx` and `matmul_bwd_dw` JIT compilation and runner wrappers using Blackwell (SM120) hardware TMA (Tensor Memory Accelerator) loads (`CopyBulkTensorTileG2SOp`) and asynchronous `mbarrier` transaction barriers.
     - Provides two isolated compilation cache routines (`get_matmul_bwd_dx_kernel` and `get_matmul_bwd_dw_kernel`) using QuACK FFI binders.
     - Specializes the JIT compilation cache with static dimensions `B = 32` and `N = 512` to enable compile-time optimization of sequence index division/modulo operations on the GPU (converting costly dynamic division instructions into 1-cycle bit-shifts and mask operations).
-    - Optimizes the `bwd_dw` epilogue writeback: when running with `SPLIT_K = 1`, the kernel bypasses global atomic additions entirely and writes accumulators directly to global memory (`g_ptr[0] = val`), eliminating atomic overhead.
-    - Integrates the autotuner to independently profile `bwd_dx` and `bwd_dw` using 4D split gradient tensors. The autotuner dynamically selects and caches the optimal configurations: `BLOCK_M = 128, BLOCK_N = 128, BLOCK_K = 32, ab_stage = 3` (triple-buffering) for `bwd_dx` to prevent WAR race conditions and NaNs, and `BLOCK_M = 64, BLOCK_N = 64, BLOCK_K = 32, ab_stage = 2` (double-buffering) for `bwd_dw` to maximize occupancy and speed (latency reduced from 34 ms to 1.75 ms).
+    - Optimizes the `bwd_dw` epilogue writeback: supports both direct coalesced global stores (`SPLIT_K = 1`) and parallel atomic additions (`SPLIT_K > 1`) across Split-K threadblock slices.
+    - Integrates the autotuner to independently profile `bwd_dx` and `bwd_dw` using 4D split gradient tensors. The autotuner dynamically selects and caches the optimal configurations: `BLOCK_M = 128, BLOCK_N = 128, BLOCK_K = 32, ab_stage = 3` (triple-buffering) for `bwd_dx` to prevent WAR race conditions and NaNs, and `BLOCK_M = 64, BLOCK_N = 64, BLOCK_K = 32, ab_stage = 3` with `SPLIT_K = 8` for `bwd_dw` to maximize parallel execution occupancy and speed.
 
 
 
@@ -275,4 +275,21 @@ graph TD
   - `s_reduction` (Float32): `BLOCK_M * 2 * HEAD_GROUP * HEAD_DIM` elements (**16 KB** for `BLOCK_M = 32, HEAD_GROUP = 1`).
   - `s_scales_reduction` (Float32): `BLOCK_M * HEAD_GROUP` elements (**128 bytes**).
   - Peak SMEM utilization is exactly **16.1 KB** or **32.2 KB** (depending on autotuned sequence tile size). Threads write to disjoint elements of shared memory to avoid bank conflicts and serialization. A cooperative block reduction sums the gradients along the sequence dimension `BLOCK_M` before writing back to global memory, reducing global atomic writes by 64x.
+
+### 8. Blackwell TMA Pipelined Backward GEMM dx Kernel Map (`bwd_dx`)
+- **Total Active Shared Memory:** **~68 KB** (well within 99 KB Blackwell limit)
+- **Allocation Details (for optimal config BLOCK_M = 128, BLOCK_N = 128, BLOCK_K = 32, ab_stage = 3):**
+  - `sX` (BFloat16, 3 stages): `BLOCK_M * BLOCK_K_STAGE * 3` = `128 * 32 * 3 = 12,288` elements (**24.576 KB**).
+  - `sW` (BFloat16, 3 stages): `BLOCK_N * BLOCK_K_STAGE * 3` = `128 * 32 * 3 = 12,288` elements (**24.576 KB**).
+  - `smem_accum` (Float32, epilogue buffer): `BLOCK_M * BLOCK_N_padded` = `128 * 136 = 17,408` elements (**69.632 KB**).
+  - Peak SMEM utilization is exactly **~68 KB** by aliasing the BFloat16 output buffer `sOut_bf16` with the `smem_accum` buffer, reducing epilogue SMEM requirements from 102 KB (violating the 99 KB limit) to 69.6 KB.
+
+### 9. Blackwell TMA Pipelined Backward GEMM dw Kernel Map (`bwd_dw`)
+- **Total Active Shared Memory:** **~24.5 KB** (within 99 KB Blackwell limit)
+- **Allocation Details (for optimal config BLOCK_M = 64, BLOCK_N = 64, BLOCK_K = 32, ab_stage = 3, SPLIT_K = 8):**
+  - `sX` (BFloat16, 3 stages): `BLOCK_M * BLOCK_K_STAGE * 3` = `64 * 32 * 3 = 6,144` elements (**12.288 KB**).
+  - `sW` (BFloat16, 3 stages): `BLOCK_N * BLOCK_K_STAGE * 3` = `64 * 32 * 3 = 6,144` elements (**12.288 KB**).
+  - `smem_accum` (Float32, epilogue buffer): `BLOCK_M * BLOCK_N_padded` = `64 * 72 = 4,608` elements (**18.432 KB**).
+  - Peak SMEM utilization is exactly **24.576 KB** (reusing mainloop memory chunks via aliasing).
+
 

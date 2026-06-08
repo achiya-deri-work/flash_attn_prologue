@@ -81,19 +81,21 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                 "maxrregcount": 255
             })
         else: # bwd_dw
-            # Support symmetric block sizes 64x64 and 128x128 with 2 or 3 stages
-            for block_size in [64, 128]:
+            # Support symmetric block sizes 64x64 with 2 or 3 stages (BLOCK_M must be 64 for TMA head dimension contiguity)
+            for block_size in [64]:
                 for bk in [32]:
                     for stage in [2, 3]:
                         for regs in [255]:
-                            candidates.append({
-                                "BLOCK_M": block_size,
-                                "BLOCK_N": block_size,
-                                "BLOCK_K": bk,
-                                "ab_stage": stage,
-                                "num_warps": 4,
-                                "maxrregcount": regs
-                            })
+                            for split_k in [1, 2, 4, 8, 16, 32]:
+                                candidates.append({
+                                    "BLOCK_M": block_size,
+                                    "BLOCK_N": block_size,
+                                    "BLOCK_K": bk,
+                                    "ab_stage": stage,
+                                    "num_warps": 4,
+                                    "maxrregcount": regs,
+                                    "SPLIT_K": split_k
+                                })
     elif mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
         candidates = []
         for hg in [1, 2, 4, 8]:
@@ -498,7 +500,7 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                     k_strides=grad_k_prof.stride(),
                     v_strides=grad_v_prof.stride(),
                     maxrregcount=regs,
-                    SPLIT_K=1
+                    SPLIT_K=config.get("SPLIT_K", 1)
                 )
                 
                 for _ in range(3):
