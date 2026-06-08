@@ -54,32 +54,36 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                     for stage in [2, 3]:
                         for warps in [4, 8]:
                             for regs in [128, 255]:
-                                # Calculate SMEM bytes
-                                block_n = hg * 3 * 64
-                                mainloop_bytes = (stage * bm * bk * 2) + (stage * block_n * bk * 2)
-                                epilogue_bytes = bm * (block_n + 8) * 4
-                                smem_bytes = max(mainloop_bytes, epilogue_bytes)
-                                if smem_bytes <= 99 * 1024:
-                                    candidates.append({
-                                        "HEAD_GROUP": hg,
-                                        "BLOCK_M": bm,
-                                        "BLOCK_K": bk,
-                                        "ab_stage": stage,
-                                        "num_warps": warps,
-                                        "maxrregcount": regs
-                                    })
+                                for swizzle in [1, 2, 4, 8, 16]:
+                                    # Calculate SMEM bytes
+                                    block_n = hg * 3 * 64
+                                    mainloop_bytes = (stage * bm * bk * 2) + (stage * block_n * bk * 2)
+                                    epilogue_bytes = bm * (block_n + 8) * 4
+                                    smem_bytes = max(mainloop_bytes, epilogue_bytes)
+                                    if smem_bytes <= 99 * 1024:
+                                        candidates.append({
+                                            "HEAD_GROUP": hg,
+                                            "BLOCK_M": bm,
+                                            "BLOCK_K": bk,
+                                            "ab_stage": stage,
+                                            "num_warps": warps,
+                                            "maxrregcount": regs,
+                                            "swizzle_x": swizzle
+                                        })
     elif mode in ("bwd_dx", "bwd_dw"):
         candidates = []
         if mode == "bwd_dx":
             # dx requires 128x128 and ab_stage = 3 to avoid Write-After-Read race conditions / NaNs
-            candidates.append({
-                "BLOCK_M": 128,
-                "BLOCK_N": 128,
-                "BLOCK_K": 32,
-                "ab_stage": 3,
-                "num_warps": 4,
-                "maxrregcount": 255
-            })
+            for swizzle in [1, 2, 4, 8, 16]:
+                candidates.append({
+                    "BLOCK_M": 128,
+                    "BLOCK_N": 128,
+                    "BLOCK_K": 32,
+                    "ab_stage": 3,
+                    "num_warps": 4,
+                    "maxrregcount": 255,
+                    "swizzle_x": swizzle
+                })
         else: # bwd_dw
             # Support symmetric block sizes 64x64 with 2 or 3 stages (BLOCK_M must be 64 for TMA head dimension contiguity)
             for block_size in [64]:
@@ -87,15 +91,17 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                     for stage in [2, 3]:
                         for regs in [255]:
                             for split_k in [1, 2, 4, 8, 16, 32]:
-                                candidates.append({
-                                    "BLOCK_M": block_size,
-                                    "BLOCK_N": block_size,
-                                    "BLOCK_K": bk,
-                                    "ab_stage": stage,
-                                    "num_warps": 4,
-                                    "maxrregcount": regs,
-                                    "SPLIT_K": split_k
-                                })
+                                for swizzle in [1, 2, 4, 8, 16]:
+                                    candidates.append({
+                                        "BLOCK_M": block_size,
+                                        "BLOCK_N": block_size,
+                                        "BLOCK_K": bk,
+                                        "ab_stage": stage,
+                                        "num_warps": 4,
+                                        "maxrregcount": regs,
+                                        "SPLIT_K": split_k,
+                                        "swizzle_x": swizzle
+                                    })
     elif mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
         candidates = []
         for hg in [1, 2, 4, 8]:
@@ -295,7 +301,8 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                     hidden=hidden,
                     use_sync_in_loop=True,
                     ab_stage=stage,
-                    maxrregcount=regs
+                    maxrregcount=regs,
+                    swizzle_x=config.get("swizzle_x", 8)
                 )
                 
                 B_prof = 2
@@ -451,7 +458,8 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                     q_strides=grad_q_prof.stride(),
                     k_strides=grad_k_prof.stride(),
                     v_strides=grad_v_prof.stride(),
-                    maxrregcount=regs
+                    maxrregcount=regs,
+                    swizzle_x=config.get("swizzle_x", 8)
                 )
                 
                 for _ in range(3):
@@ -501,7 +509,8 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                     k_strides=grad_k_prof.stride(),
                     v_strides=grad_v_prof.stride(),
                     maxrregcount=regs,
-                    SPLIT_K=config.get("SPLIT_K", 1)
+                    SPLIT_K=config.get("SPLIT_K", 1),
+                    swizzle_x=config.get("swizzle_x", 8)
                 )
                 
                 for _ in range(3):

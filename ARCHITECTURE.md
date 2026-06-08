@@ -297,5 +297,14 @@ graph TD
 - **Blackwell Workaround:** On GeForce Blackwell (SM120), hardware TMA multicast is not supported. To work around this, we launch both [matmul_bwd_dx](file:///home/achiya/vs_code_main/flash_attn_prologue/flash_attn_prologue/gemm_bwd.py) and [matmul_bwd_dw](file:///home/achiya/vs_code_main/flash_attn_prologue/flash_attn_prologue/gemm_bwd.py) using a Thread Block Cluster of size 2 along the X grid dimension.
 - **Scheduling and Memory Flow:** The cluster configuration instructs the GPU scheduler to map sibling CTAs onto physically adjacent SMs. When the first CTA issues a standard TMA load to bring a tile of `weight` (for `bwd_dx`) or `x_flat` (for `bwd_dw`) from global memory, the tile is cached in L2. Sibling CTAs requesting the same tile will hit the L2 cache instead of hitting global memory, effectively neutralizing the GMEM read bottleneck by up to a factor of 2x.
 
+### 11. On-Chip JIT Split-K Reduction Kernel Map
+- **Layout & Execution Flow:** For Split-K > 1, the `bwd_dw` JIT kernel writes intermediate Float32 sums to a global workspace tensor of shape `[SPLIT_K, M_dim, N_dim]`. Instead of running PyTorch eager `.sum(dim=0)`, we call a specialized, JIT-compiled CuTe reduction kernel `SplitKReductionCute` on the active stream.
+- **Thread Block Tiling:** The reduction kernel tiles the workspace along M and N dimensions using blocks of `16x64`. With `num_threads = 256`, the loop unrolls 4 times per thread block to cover the 1024 elements in the tile. Threads load Float32 workspace slices directly from global memory using raw pointer subscripting, sum along the Z (split-K) dimension in registers, and store the reduced result directly to global memory as BFloat16, bypassing any PyTorch API or memory management overhead.
+
+### 12. Register-Level Cast & Store Epilogue Map
+- **Eliminating Shared Memory Buffers:** In the forward (`fused_qkv.py`) and backward dx (`gemm_bwd.py`) kernels, instead of storing Float32 accumulators to a shared memory buffer, casting them to BFloat16, and copying them out, the accumulators are cast to BFloat16 directly within registers using `cute.make_fragment_like(accum, BFloat16)`.
+- **MMA-Partitioned Coalesced Writes:** The register fragments are written to the partitioned BFloat16 output shared memory buffer `sOut_bf16` using `copy_atom_r2s_bf16`. This design completely eliminates the Float32 shared memory epilogue buffers (saving 48 KB - 98 KB SMEM), reducing dynamic memory pressure and enabling greater block occupancy.
+
+
 
 

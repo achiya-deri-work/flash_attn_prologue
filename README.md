@@ -11,7 +11,9 @@ This project contains a high-performance custom CUDA kernel implementation for a
 - **Split-N Optimization:** A specialized cooperatively partitioned threadblock design (`fused_qkv_cute_splitn`) targeting consumer Blackwell platforms (`sm_120a`) to avoid TMEM hardware requirements.
 - Triton Standalone Epilogue: A standalone Triton kernel (`qknorm_rope_scale`) fusing epilogue operations after a standard PyTorch linear layer.
 - **CuTe Standalone Epilogue:** High-performance, layout-agnostic standalone forward and backward CuTe epilogue operators (`qknorm_rope_scale_cute_op` / `qknorm_rope_scale_cute_backward_op`) that mutate separate Q/K tensors in-place, specialize on strides at JIT compile time to eliminate `.contiguous()` conversions, and run up to 2.33x faster than Triton.
-- **Blackwell TMA-based Backward GEMM Kernels:** Features high-performance JIT-compiled backward GEMM kernels (`matmul_bwd_dx` and `matmul_bwd_dw`) utilizing hardware TMA loads and asynchronous `mbarrier` transaction barriers on SM120.
+- **Blackwell TMA-based Backward GEMM Kernels:** Features high-performance JIT-compiled backward GEMM kernels (`matmul_bwd_dx` and `matmul_bwd_dw`) utilizing hardware TMA loads, asynchronous `mbarrier` transaction barriers, and a custom on-chip JIT Split-K reduction kernel on SM120.
+- **Dynamic Register Fine-Tuning & Register-Level Epilogue Cast:** Minimizes register pressure via dynamic nvvm setmaxregister controls and completely eliminates dynamic shared memory epilogue writeback buffer allocations by casting accumulator fragments directly in registers and storing via BFloat16 MMA partition layout maps.
+- **Autotuning Grid Swizzling:** Autotunes the grid swizzle factors (`swizzle_x` values `[1, 2, 4, 8, 16]`) to optimize hardware L2 cache saturation on SM120.
 - **torch.compile Integration:** Fully compatible with `torch.compile` via custom PyTorch operator registration and custom schema definitions.
 
 ## Installation

@@ -15,7 +15,7 @@ from quack.compile_utils import make_fake_tensor
 from quack import copy_utils
 
 class FusedQKV:
-    def __init__(self, num_warps: int = 4, BLOCK_M: int = 64, BLOCK_K_STAGE: int = 32, NUM_HEADS: int = 16, HEAD_DIM: int = 64, HEAD_GROUP: int = 2, hidden: int = 512, use_sync_in_loop: bool = True, ab_stage: int = None):
+    def __init__(self, num_warps: int = 4, BLOCK_M: int = 64, BLOCK_K_STAGE: int = 32, NUM_HEADS: int = 16, HEAD_DIM: int = 64, HEAD_GROUP: int = 2, hidden: int = 512, use_sync_in_loop: bool = True, ab_stage: int = None, swizzle_x: int = 8):
         self.num_warps = num_warps  # 4 warps (128 threads)
         self.BLOCK_M = BLOCK_M
         self.HEAD_DIM = HEAD_DIM
@@ -26,6 +26,7 @@ class FusedQKV:
         self.hidden = hidden
         self.k_tile_cnt = hidden // BLOCK_K_STAGE
         self.use_sync_in_loop = use_sync_in_loop
+        self.swizzle_x = swizzle_x
         
         # Calculate shared memory footprint for 3 stages dynamically
         sX_elements_3 = self.BLOCK_M * self.BLOCK_K_STAGE * 3
@@ -65,7 +66,7 @@ class FusedQKV:
         
         # Calculate maximum shared memory size needed in bytes and elements
         mainloop_bytes = (self.ab_stage * self.BLOCK_M * self.BLOCK_K_STAGE * 2) + (self.ab_stage * self.BLOCK_N * self.BLOCK_K_STAGE * 2)
-        epilogue_bytes = self.BLOCK_M * self.BLOCK_N_padded * 4
+        epilogue_bytes = self.BLOCK_M * self.BLOCK_N_padded * 2
         self.max_smem_bytes = max(mainloop_bytes, epilogue_bytes)
         self.flat_smem_elements = cute.ceil_div(self.max_smem_bytes, 4)
         
@@ -88,6 +89,7 @@ class FusedQKV:
         # 4. Copy atom for Float32 accumulator writeback
         copy_op_r2s = cute.nvgpu.CopyUniversalOp()
         self.copy_atom_r2s = cute.make_copy_atom(copy_op_r2s, Float32)
+        self.copy_atom_r2s_bf16 = cute.make_copy_atom(copy_op_r2s, BFloat16)
         
         # 5. TiledCopy configuration for direct-store epilogue
         store_op = cute.nvgpu.CopyUniversalOp()
@@ -161,7 +163,7 @@ class FusedQKV:
             (self.HEAD_GROUP * self.HEAD_DIM, self.BLOCK_K_STAGE)
         )
         
-        swizzle_x = 8
+        swizzle_x = self.swizzle_x
         grid_x_blocks = cute.ceil_div(N, self.BLOCK_M)
         swizzled_grid_x = cute.ceil_div(grid_x_blocks, swizzle_x) * swizzle_x
         
@@ -172,7 +174,7 @@ class FusedQKV:
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
             self.epi_smem_layout,
-            self.copy_atom_r2s,
+            self.copy_atom_r2s_bf16,
             self.gmem_tiled_copy_store,
             tma_atom_x, tma_tensor_x,
             tma_atom_wq, tma_tensor_wq,
@@ -199,7 +201,7 @@ class FusedQKV:
         a_smem_layout: cute.Layout,
         b_smem_layout: cute.Layout,
         epi_smem_layout: cute.Layout,
-        copy_atom_r2s: cute.CopyAtom,
+        copy_atom_r2s_bf16: cute.CopyAtom,
         gmem_tiled_copy_store: cute.TiledCopy,
         tma_atom_x: cute.CopyAtom,
         tma_tensor_x: cute.Tensor,
@@ -218,8 +220,8 @@ class FusedQKV:
         block_idx_y = cute.arch.block_idx()[1]
         block_idx_z = cute.arch.block_idx()[2]
         
-        # 2D Grid Swizzling with SWIZZLE_X = 8
-        swizzle_x = 8
+        # 2D Grid Swizzling with parameterized swizzle_x
+        swizzle_x = self.swizzle_x
         N = x.shape[1]
         actual_grid_dim_x = cute.ceil_div(N, self.BLOCK_M)
         
@@ -315,8 +317,8 @@ class FusedQKV:
         thr_mma = tiled_mma.get_slice(tidx)
         
         # Partition accumulator C (registers)
-        smem_accum = cute.make_tensor(storage.sX_raw.data_ptr().align(16), epi_smem_layout)
-        tCsC = thr_mma.partition_C(smem_accum)
+        smem_accum_f32 = cute.make_tensor(cute.recast_ptr(storage.sX_raw.data_ptr().align(16), dtype=Float32), epi_smem_layout)
+        tCsC = thr_mma.partition_C(smem_accum_f32)
         accum = tiled_mma.make_fragment_C(tCsC)
         accum.fill(0.0)
         
@@ -360,6 +362,8 @@ class FusedQKV:
             cute.autovec_copy(tCsA_init, rA_0)
             cute.autovec_copy(tCsB_init, rB_0)
             
+        cute.arch.setmaxregister_increase(248)
+        
         # Main execution loop
         for k_tile in cutlass.range_constexpr(self.k_tile_cnt):
             pipe_read = k_tile % self.ab_stage
@@ -401,49 +405,17 @@ class FusedQKV:
             else:
                 cute.gemm(tiled_mma, accum, rA_1, rB_1, accum)
             
-        # Write Float32 accumulator to sBuf
-        cute.copy(copy_atom_r2s, accum, tCsC)
-        cute.arch.sync_threads()
-
-        sOut_bf16 = cute.make_tensor(cute.recast_ptr(storage.sX_raw.data_ptr().align(16), dtype=BFloat16), cute.make_layout((self.BLOCK_M, self.BLOCK_N), stride=(self.BLOCK_N_padded, 1)))
+        cute.arch.setmaxregister_decrease(128)
         
-        q_reg = cute.make_rmem_tensor((self.HEAD_DIM,), Float32)
-        k_reg = cute.make_rmem_tensor((self.HEAD_DIM,), Float32)
-        v_reg = cute.make_rmem_tensor((self.HEAD_DIM,), Float32)
+        # Write Float32 accumulator directly to sOut_bf16 by casting to BFloat16 in registers first
+        sOut_bf16 = cute.make_tensor(cute.recast_ptr(storage.sX_raw.data_ptr().align(16), dtype=BFloat16), epi_smem_layout)
+        tCsOut = thr_mma.partition_C(sOut_bf16)
+        accum_bf16 = cute.make_fragment_like(tCsOut, BFloat16)
         
-        row_offset = r * self.BLOCK_N_padded + h_local * (3 * self.HEAD_DIM)
-        
-        if seq < N and h_local < self.HEAD_GROUP:
-            q_ptr = smem_accum.iterator + row_offset
-            k_ptr = smem_accum.iterator + row_offset + self.HEAD_DIM
-            v_ptr = smem_accum.iterator + row_offset + 2 * self.HEAD_DIM
+        for idx in cutlass.range(cute.size(accum), unroll_full=True):
+            accum_bf16[idx] = BFloat16(accum[idx])
             
-            q_smem = cute.make_tensor(q_ptr, cute.make_layout((self.HEAD_DIM,)))
-            k_smem = cute.make_tensor(k_ptr, cute.make_layout((self.HEAD_DIM,)))
-            v_smem = cute.make_tensor(v_ptr, cute.make_layout((self.HEAD_DIM,)))
-            
-            cute.autovec_copy(q_smem, q_reg)
-            cute.autovec_copy(k_smem, k_reg)
-            cute.autovec_copy(v_smem, v_reg)
-            
-            # Recast and write directly to sOut_bf16 in BFloat16 format
-            out_q_smem = cute.make_tensor(sOut_bf16.iterator + row_offset, cute.make_layout((self.HEAD_DIM,)))
-            out_k_smem = cute.make_tensor(sOut_bf16.iterator + row_offset + self.HEAD_DIM, cute.make_layout((self.HEAD_DIM,)))
-            out_v_smem = cute.make_tensor(sOut_bf16.iterator + row_offset + 2 * self.HEAD_DIM, cute.make_layout((self.HEAD_DIM,)))
-            
-            q_bf16 = cute.make_rmem_tensor((self.HEAD_DIM,), BFloat16)
-            k_bf16 = cute.make_rmem_tensor((self.HEAD_DIM,), BFloat16)
-            v_bf16 = cute.make_rmem_tensor((self.HEAD_DIM,), BFloat16)
-            
-            for j in cutlass.range(self.HEAD_DIM, unroll_full=True):
-                q_bf16[j] = BFloat16(q_reg[j])
-                k_bf16[j] = BFloat16(k_reg[j])
-                v_bf16[j] = BFloat16(v_reg[j])
-                
-            cute.autovec_copy(q_bf16, out_q_smem)
-            cute.autovec_copy(k_bf16, out_k_smem)
-            cute.autovec_copy(v_bf16, out_v_smem)
-            
+        cute.copy(copy_atom_r2s_bf16, accum_bf16, tCsOut)
         cute.arch.sync_threads()
         
         thr_copy_store = gmem_tiled_copy_store.get_slice(tidx)
@@ -503,8 +475,8 @@ class FusedQKV:
 
 _fused_qkv_compile_cache = {}
 
-def get_fused_qkv_kernel(num_warps=4, BLOCK_M=64, BLOCK_K_STAGE=32, NUM_HEADS=16, HEAD_DIM=64, HEAD_GROUP=2, hidden=512, use_sync_in_loop=True, ab_stage=None, maxrregcount=255):
-    key = (num_warps, BLOCK_M, BLOCK_K_STAGE, NUM_HEADS, HEAD_DIM, HEAD_GROUP, hidden, use_sync_in_loop, ab_stage, maxrregcount)
+def get_fused_qkv_kernel(num_warps=4, BLOCK_M=64, BLOCK_K_STAGE=32, NUM_HEADS=16, HEAD_DIM=64, HEAD_GROUP=2, hidden=512, use_sync_in_loop=True, ab_stage=None, maxrregcount=255, swizzle_x=8):
+    key = (num_warps, BLOCK_M, BLOCK_K_STAGE, NUM_HEADS, HEAD_DIM, HEAD_GROUP, hidden, use_sync_in_loop, ab_stage, maxrregcount, swizzle_x)
     if key not in _fused_qkv_compile_cache:
         B_sym = cute.sym_int()
         N_sym = cute.sym_int()
@@ -518,7 +490,8 @@ def get_fused_qkv_kernel(num_warps=4, BLOCK_M=64, BLOCK_K_STAGE=32, NUM_HEADS=16
             HEAD_GROUP=HEAD_GROUP,
             hidden=hidden,
             use_sync_in_loop=use_sync_in_loop,
-            ab_stage=ab_stage
+            ab_stage=ab_stage,
+            swizzle_x=swizzle_x
         )
         
         x_fake = make_fake_tensor(BFloat16, (B_sym, N_sym, hidden), 16)
@@ -561,6 +534,7 @@ def fused_qkv_op(
     ab_stage = config.get("ab_stage", None)
     num_warps = config.get("num_warps", 4)
     maxrregcount = config.get("maxrregcount", 255)
+    swizzle_x = config.get("swizzle_x", 8)
     
     q_proj_bf16 = torch.empty((B, num_heads, N, head_dim), dtype=torch.bfloat16, device=x.device)
     k_proj_bf16 = torch.empty((B, num_heads, N, head_dim), dtype=torch.bfloat16, device=x.device)
@@ -576,7 +550,8 @@ def fused_qkv_op(
         hidden=hidden,
         use_sync_in_loop=True,
         ab_stage=ab_stage,
-        maxrregcount=maxrregcount
+        maxrregcount=maxrregcount,
+        swizzle_x=swizzle_x
     )
     
     num_heads_x_dim = num_heads * head_dim
@@ -606,16 +581,28 @@ def _fused_qkv_setup_context(ctx, inputs, output):
     q_proj, k_proj, v_proj = output
     ctx.save_for_backward(x, weight)
 
+_BACKWARD_DX_STREAM = None
+
 def _fused_qkv_backward(ctx, grad_q_proj, grad_k_proj, grad_v_proj):
     x, weight = ctx.saved_tensors
     B, N, hidden = x.shape
     
     from flash_attn_prologue.gemm_bwd import matmul_bwd_dx, matmul_bwd_dw
-    grad_x_flat = matmul_bwd_dx(grad_q_proj, grad_k_proj, grad_v_proj, weight)
-    grad_x = grad_x_flat.reshape(B, N, hidden)
     
+    # Run matmul_bwd_dx and matmul_bwd_dw concurrently on separate CUDA streams
+    global _BACKWARD_DX_STREAM
+    if _BACKWARD_DX_STREAM is None:
+        _BACKWARD_DX_STREAM = torch.cuda.Stream(device=grad_q_proj.device)
+        
+    with torch.cuda.stream(_BACKWARD_DX_STREAM):
+        grad_x_flat = matmul_bwd_dx(grad_q_proj, grad_k_proj, grad_v_proj, weight)
+        
     grad_weight = matmul_bwd_dw(grad_q_proj, grad_k_proj, grad_v_proj, x)
     
+    # Synchronize default stream with _BACKWARD_DX_STREAM
+    torch.cuda.current_stream().wait_stream(_BACKWARD_DX_STREAM)
+    
+    grad_x = grad_x_flat.reshape(B, N, hidden)
     return grad_x, grad_weight
 
 torch.library.register_autograd(
