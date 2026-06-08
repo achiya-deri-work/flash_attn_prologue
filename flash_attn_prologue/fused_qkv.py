@@ -600,3 +600,26 @@ def _fused_qkv_fake(x, weight):
     k_proj = torch.empty((B, num_heads, N, head_dim), dtype=x.dtype, device=x.device)
     v_proj = torch.empty((B, num_heads, N, head_dim), dtype=x.dtype, device=x.device)
     return q_proj, k_proj, v_proj
+
+def _fused_qkv_setup_context(ctx, inputs, output):
+    x, weight = inputs
+    q_proj, k_proj, v_proj = output
+    ctx.save_for_backward(x, weight)
+
+def _fused_qkv_backward(ctx, grad_q_proj, grad_k_proj, grad_v_proj):
+    x, weight = ctx.saved_tensors
+    B, N, hidden = x.shape
+    
+    from flash_attn_prologue.gemm_bwd import matmul_bwd_dx, matmul_bwd_dw
+    grad_x_flat = matmul_bwd_dx(grad_q_proj, grad_k_proj, grad_v_proj, weight)
+    grad_x = grad_x_flat.reshape(B, N, hidden)
+    
+    grad_weight = matmul_bwd_dw(grad_q_proj, grad_k_proj, grad_v_proj, x)
+    
+    return grad_x, grad_weight
+
+torch.library.register_autograd(
+    "flash_prologue::fused_qkv",
+    _fused_qkv_backward,
+    setup_context=_fused_qkv_setup_context
+)

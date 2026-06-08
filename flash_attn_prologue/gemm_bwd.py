@@ -18,16 +18,22 @@ from quack.compile_utils import make_fake_tensor
 from quack import copy_utils
 
 class GemmBwdDxCute:
-    def __init__(self, num_warps: int = 4, BLOCK_M: int = 64, BLOCK_N: int = 64, BLOCK_K_STAGE: int = 32, ab_stage: int = 3, M_dim = None, K_dim: int = 3072, N_dim: int = 512):
+    def __init__(self, num_warps: int = 4, BLOCK_M: int = 64, BLOCK_N: int = 64, BLOCK_K_STAGE: int = 32, ab_stage: int = 3, B: int = 32, N: int = 512, M_dim = None, K_dim: int = 3072, N_dim: int = 512, NUM_HEADS: int = 16, HEAD_DIM: int = 64, q_strides=None, k_strides=None, v_strides=None):
         self.num_warps = num_warps
         self.BLOCK_M = BLOCK_M
         self.BLOCK_N = BLOCK_N
         self.BLOCK_K_STAGE = BLOCK_K_STAGE
         self.ab_stage = ab_stage
+        self.B = B
+        self.N = N
         self.M_dim = M_dim
         self.K_dim = K_dim
         self.N_dim = N_dim
-        self.k_tile_cnt = K_dim // BLOCK_K_STAGE
+        self.NUM_HEADS = NUM_HEADS
+        self.HEAD_DIM = HEAD_DIM
+        self.q_strides = q_strides
+        self.k_strides = k_strides
+        self.v_strides = v_strides
         
     def _setup(self):
         # sX is row-major (since grad_output is row-major)
@@ -84,33 +90,34 @@ class GemmBwdDxCute:
             cute.make_ordered_layout((store_thr_m, store_thr_n), order=(1, 0)),
             cute.make_layout((1, 8))
         )
+        
+        # Copy atom for vectorized 8-element (128-bit) G2S copy
+        copy_op_g2s = cute.nvgpu.CopyUniversalOp()
+        self.gmem_tiled_copy_8 = cute.make_tiled_copy_tv(
+            cute.make_copy_atom(copy_op_g2s, BFloat16, num_bits_per_copy=128),
+            cute.make_ordered_layout((1, 1), order=(0, 0)),
+            cute.make_layout((1, 8))
+        )
 
     @cute.jit
     def __call__(
         self,
-        grad_output: cute.Tensor,
+        grad_q: cute.Tensor,
+        grad_k: cute.Tensor,
+        grad_v: cute.Tensor,
         weight: cute.Tensor,
         grad_x: cute.Tensor,
         stream
     ):
         self._setup()
         
-        M_dim = grad_output.shape[0]
+        M_dim = grad_q.shape[0] * grad_q.shape[2] # B * N
         num_threads = self.num_warps * 32
         
-        gA = cute.make_tensor(grad_output.iterator, cute.make_layout((M_dim, self.K_dim), stride=(self.K_dim, 1)))
         gB = cute.make_tensor(weight.iterator, cute.make_layout((self.K_dim, self.N_dim), stride=(self.N_dim, 1)))
-        gO = cute.make_tensor(grad_x.iterator, cute.make_layout((M_dim, self.N_dim), stride=(self.N_dim, 1)))
         
         # Make TMA load descriptors
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp()
-        
-        tma_atom_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
-            tma_load_op,
-            gA,
-            cute.make_layout((self.BLOCK_M, self.BLOCK_K_STAGE), stride=(self.BLOCK_K_STAGE, 1)),
-            (self.BLOCK_M, self.BLOCK_K_STAGE)
-        )
         
         tma_atom_b, tma_tensor_b = cpasync.make_tiled_tma_atom(
             tma_load_op,
@@ -124,7 +131,7 @@ class GemmBwdDxCute:
         swizzled_grid_x = cute.ceil_div(grid_x_blocks, swizzle_x) * swizzle_x
         
         self.kernel(
-            grad_output, weight, grad_x,
+            grad_q, grad_k, grad_v, weight, grad_x,
             self.tiled_mma,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -132,8 +139,11 @@ class GemmBwdDxCute:
             self.epi_smem_layout,
             self.copy_atom_r2s,
             self.gmem_tiled_copy_store,
-            tma_atom_a, tma_tensor_a,
             tma_atom_b, tma_tensor_b,
+            self.gmem_tiled_copy_8,
+            int(self.q_strides[0]), int(self.q_strides[1]), int(self.q_strides[2]),
+            int(self.k_strides[0]), int(self.k_strides[1]), int(self.k_strides[2]),
+            int(self.v_strides[0]), int(self.v_strides[1]), int(self.v_strides[2]),
             Boolean(True)
         ).launch(
             grid=[swizzled_grid_x, cute.ceil_div(self.N_dim, self.BLOCK_N), 1],
@@ -144,7 +154,9 @@ class GemmBwdDxCute:
     @cute.kernel
     def kernel(
         self,
-        grad_output: cute.Tensor,
+        grad_q: cute.Tensor,
+        grad_k: cute.Tensor,
+        grad_v: cute.Tensor,
         weight: cute.Tensor,
         grad_x: cute.Tensor,
         tiled_mma: cute.TiledMma,
@@ -154,16 +166,19 @@ class GemmBwdDxCute:
         epi_smem_layout: cute.Layout,
         copy_atom_r2s: cute.CopyAtom,
         gmem_tiled_copy_store: cute.TiledCopy,
-        tma_atom_a: cute.CopyAtom,
-        tma_tensor_a: cute.Tensor,
         tma_atom_b: cute.CopyAtom,
         tma_tensor_b: cute.Tensor,
+        gmem_tiled_copy_8: cute.TiledCopy,
+        q_stride_0: int, q_stride_1: int, q_stride_2: int,
+        k_stride_0: int, k_stride_1: int, k_stride_2: int,
+        v_stride_0: int, v_stride_1: int, v_stride_2: int,
         use_sync_in_loop: Boolean
     ):
         grid_dim_x = cute.arch.grid_dim()[0]
         block_idx_x = cute.arch.block_idx()[0]
         block_idx_y = cute.arch.block_idx()[1]
         tidx, _, _ = cute.arch.thread_idx()
+        num_threads = self.num_warps * 32
         
         # 2D Grid Swizzling with compile-time constant group size
         swizzle_x = 8
@@ -177,7 +192,9 @@ class GemmBwdDxCute:
         cta_m_raw = swizzle_group * swizzle_x + (offset_in_group % swizzle_x)
         cta_n = offset_in_group // swizzle_x
         
-        M_dim = grad_output.shape[0]
+        B = self.B
+        N = self.N
+        M_dim = B * N
         K_dim = self.K_dim
         N_dim = self.N_dim
         
@@ -185,11 +202,10 @@ class GemmBwdDxCute:
         is_valid = cta_m_raw < actual_grid_dim_x
         cta_m = cutlass.min(cta_m_raw, actual_grid_dim_x - 1)
         
-        k_tile_cnt = self.k_tile_cnt
+        k_tile_cnt = K_dim // self.BLOCK_K_STAGE
         
         # Prefetch TMA descriptors
         if tidx == 0:
-            cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
             
         smem = cutlass.utils.SmemAllocator()
@@ -218,17 +234,6 @@ class GemmBwdDxCute:
         rA_1 = tiled_mma.make_fragment_A(tCsX[None, None, None, 0])
         rB_1 = tiled_mma.make_fragment_B(tCsW[None, None, None, 0])
         
-        # Partition global tensors inside kernel
-        gA_tile = cute.local_tile(tma_tensor_a, (self.BLOCK_M, self.BLOCK_K_STAGE), (cta_m, None))
-        copy_A, _, _ = copy_utils.tma_get_copy_fn(
-            tma_atom_a,
-            cta_coord=0,
-            cta_layout=cute.make_layout(1),
-            src_tensor=gA_tile,
-            dst_tensor=sX_aligned,
-            single_stage=False
-        )
-        
         gB_tile = cute.local_tile(tma_tensor_b, (self.BLOCK_K_STAGE, self.BLOCK_N), (None, cta_n))
         copy_B, _, _ = copy_utils.tma_get_copy_fn(
             tma_atom_b,
@@ -252,11 +257,50 @@ class GemmBwdDxCute:
             if stage < k_tile_cnt:
                 if tidx < 32:
                     if tidx == 0:
-                        tx_bytes = (self.BLOCK_M * self.BLOCK_K_STAGE * 2) + (self.BLOCK_N * self.BLOCK_K_STAGE * 2)
+                        tx_bytes = self.BLOCK_N * self.BLOCK_K_STAGE * 2
                         cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr + stage, tx_bytes)
                     cute.arch.sync_warp()
-                    copy_A(stage, stage, tma_bar_ptr=mbar_ptr + stage)
                     copy_B(stage, stage, tma_bar_ptr=mbar_ptr + stage)
+                    
+                # Vectorized zero-copy load of A
+                k_curr = stage * self.BLOCK_K_STAGE
+                qkv_idx = k_curr // (self.NUM_HEADS * self.HEAD_DIM)
+                k_start_rel = k_curr % (self.NUM_HEADS * self.HEAD_DIM)
+                
+                threads_x_A = self.BLOCK_K_STAGE // 8
+                threads_y_A = num_threads // threads_x_A
+                ty_A = tidx // threads_x_A
+                tx_A = tidx % threads_x_A
+                rows_per_thread_A = self.BLOCK_M // threads_y_A
+                
+                for r_idx in cutlass.range(rows_per_thread_A, unroll_full=True):
+                    row = ty_A + r_idx * threads_y_A
+                    col = tx_A * 8
+                    m_global = cta_m * self.BLOCK_M + row
+                    s_dst = cute.make_tensor((sX_aligned.iterator + (stage * self.BLOCK_M * self.BLOCK_K_STAGE + row * self.BLOCK_K_STAGE + col)).align(16), cute.make_layout((8,)))
+                    
+                    if m_global < M_dim:
+                        b = m_global // N
+                        n = m_global % N
+                        k_global = k_start_rel + col
+                        h = k_global // self.HEAD_DIM
+                        d = k_global % self.HEAD_DIM
+                        
+                        if qkv_idx == 0:
+                            offset = b * q_stride_0 + h * q_stride_1 + n * q_stride_2 + d
+                            g_src = cute.make_tensor((grad_q.iterator + offset).align(16), cute.make_layout((8,)))
+                            cute.copy(gmem_tiled_copy_8, g_src, s_dst)
+                        elif qkv_idx == 1:
+                            offset = b * k_stride_0 + h * k_stride_1 + n * k_stride_2 + d
+                            g_src = cute.make_tensor((grad_k.iterator + offset).align(16), cute.make_layout((8,)))
+                            cute.copy(gmem_tiled_copy_8, g_src, s_dst)
+                        else:
+                            offset = b * v_stride_0 + h * v_stride_1 + n * v_stride_2 + d
+                            g_src = cute.make_tensor((grad_v.iterator + offset).align(16), cute.make_layout((8,)))
+                            cute.copy(gmem_tiled_copy_8, g_src, s_dst)
+                    else:
+                        for j in cutlass.range(8, unroll_full=True):
+                            s_dst[j] = BFloat16(0.0)
                     
         # Wait for stage 0 and prefetch to registers
         if k_tile_cnt > 0:
@@ -269,7 +313,7 @@ class GemmBwdDxCute:
             cute.autovec_copy(tCsB_init, rB_0)
             
         # Main execution loop
-        for k_tile in cutlass.range_constexpr(self.k_tile_cnt):
+        for k_tile in cutlass.range_constexpr(k_tile_cnt):
             pipe_read = k_tile % self.ab_stage
             pipe_write = (k_tile + self.ab_stage - 1) % self.ab_stage
             next_pipe_read = (k_tile + 1) % self.ab_stage
@@ -278,18 +322,56 @@ class GemmBwdDxCute:
             if next_gmem_read < k_tile_cnt:
                 if tidx < 32:
                     if tidx == 0:
-                        tx_bytes = (self.BLOCK_M * self.BLOCK_K_STAGE * 2) + (self.BLOCK_N * self.BLOCK_K_STAGE * 2)
+                        tx_bytes = self.BLOCK_N * self.BLOCK_K_STAGE * 2
                         cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr + pipe_write, tx_bytes)
                     cute.arch.sync_warp()
-                    copy_A(next_gmem_read, pipe_write, tma_bar_ptr=mbar_ptr + pipe_write)
                     copy_B(next_gmem_read, pipe_write, tma_bar_ptr=mbar_ptr + pipe_write)
+                    
+                # Vectorized zero-copy load of A
+                k_curr = next_gmem_read * self.BLOCK_K_STAGE
+                qkv_idx = k_curr // (self.NUM_HEADS * self.HEAD_DIM)
+                k_start_rel = k_curr % (self.NUM_HEADS * self.HEAD_DIM)
+                
+                threads_x_A = self.BLOCK_K_STAGE // 8
+                threads_y_A = num_threads // threads_x_A
+                ty_A = tidx // threads_x_A
+                tx_A = tidx % threads_x_A
+                rows_per_thread_A = self.BLOCK_M // threads_y_A
+                
+                for r_idx in cutlass.range(rows_per_thread_A, unroll_full=True):
+                    row = ty_A + r_idx * threads_y_A
+                    col = tx_A * 8
+                    m_global = cta_m * self.BLOCK_M + row
+                    s_dst = cute.make_tensor((sX_aligned.iterator + (pipe_write * self.BLOCK_M * self.BLOCK_K_STAGE + row * self.BLOCK_K_STAGE + col)).align(16), cute.make_layout((8,)))
+                    
+                    if m_global < M_dim:
+                        b = m_global // N
+                        n = m_global % N
+                        k_global = k_start_rel + col
+                        h = k_global // self.HEAD_DIM
+                        d = k_global % self.HEAD_DIM
+                        
+                        if qkv_idx == 0:
+                            offset = b * q_stride_0 + h * q_stride_1 + n * q_stride_2 + d
+                            g_src = cute.make_tensor((grad_q.iterator + offset).align(16), cute.make_layout((8,)))
+                            cute.copy(gmem_tiled_copy_8, g_src, s_dst)
+                        elif qkv_idx == 1:
+                            offset = b * k_stride_0 + h * k_stride_1 + n * k_stride_2 + d
+                            g_src = cute.make_tensor((grad_k.iterator + offset).align(16), cute.make_layout((8,)))
+                            cute.copy(gmem_tiled_copy_8, g_src, s_dst)
+                        else:
+                            offset = b * v_stride_0 + h * v_stride_1 + n * v_stride_2 + d
+                            g_src = cute.make_tensor((grad_v.iterator + offset).align(16), cute.make_layout((8,)))
+                            cute.copy(gmem_tiled_copy_8, g_src, s_dst)
+                    else:
+                        for j in cutlass.range(8, unroll_full=True):
+                            s_dst[j] = BFloat16(0.0)
                     
             # Prefetch next stage's registers
             if k_tile + 1 < k_tile_cnt:
                 next_phase = ((k_tile + 1) // self.ab_stage) % 2
                 cute.arch.mbarrier_wait(mbar_ptr + next_pipe_read, next_phase)
-                if use_sync_in_loop:
-                    cute.arch.sync_threads()
+                cute.arch.sync_threads()
                     
                 tCsA_next = tCsX[None, None, None, next_pipe_read]
                 tCsB_next = tCsW[None, None, None, next_pipe_read]
@@ -352,17 +434,23 @@ class GemmBwdDxCute:
 
 
 class GemmBwdDwCute:
-    def __init__(self, num_warps: int = 4, BLOCK_M: int = 64, BLOCK_N: int = 64, BLOCK_K_STAGE: int = 32, ab_stage: int = 3, M_dim: int = 3072, K_dim: int = 512, N_dim: int = 512, SPLIT_K: int = 16):
+    def __init__(self, num_warps: int = 4, BLOCK_M: int = 64, BLOCK_N: int = 64, BLOCK_K_STAGE: int = 32, ab_stage: int = 3, B: int = 32, N: int = 512, M_dim: int = 3072, K_dim = None, N_dim: int = 512, NUM_HEADS: int = 16, HEAD_DIM: int = 64, q_strides=None, k_strides=None, v_strides=None, SPLIT_K: int = 1):
         self.num_warps = num_warps
         self.BLOCK_M = BLOCK_M
         self.BLOCK_N = BLOCK_N
         self.BLOCK_K_STAGE = BLOCK_K_STAGE
         self.ab_stage = ab_stage
+        self.B = B
+        self.N = N
         self.M_dim = M_dim
         self.K_dim = K_dim
         self.N_dim = N_dim
+        self.NUM_HEADS = NUM_HEADS
+        self.HEAD_DIM = HEAD_DIM
+        self.q_strides = q_strides
+        self.k_strides = k_strides
+        self.v_strides = v_strides
         self.SPLIT_K = SPLIT_K
-        self.k_tile_cnt = K_dim // BLOCK_K_STAGE
         
     def _setup(self):
         # Staged shared memory layouts (Dw is column-major/strided for both X and W)
@@ -410,11 +498,21 @@ class GemmBwdDwCute:
         # Copy atom for Float32 accumulator writeback
         copy_op_r2s = cute.nvUniversalCopyOp() if hasattr(cute, "nvUniversalCopyOp") else cute.nvgpu.CopyUniversalOp()
         self.copy_atom_r2s = cute.make_copy_atom(copy_op_r2s, Float32)
+        
+        # Copy atom for vectorized 8-element (128-bit) G2S copy
+        copy_op_g2s = cute.nvgpu.CopyUniversalOp()
+        self.gmem_tiled_copy_8 = cute.make_tiled_copy_tv(
+            cute.make_copy_atom(copy_op_g2s, BFloat16, num_bits_per_copy=128),
+            cute.make_ordered_layout((1, 1), order=(0, 0)),
+            cute.make_layout((1, 8))
+        )
 
     @cute.jit
     def __call__(
         self,
-        grad_output_t: cute.Tensor,
+        grad_q: cute.Tensor,
+        grad_k: cute.Tensor,
+        grad_v: cute.Tensor,
         x: cute.Tensor,
         grad_weight: cute.Tensor,
         stream
@@ -423,19 +521,10 @@ class GemmBwdDwCute:
         
         num_threads = self.num_warps * 32
         
-        gA = cute.make_tensor(grad_output_t.iterator, cute.make_layout((self.K_dim, self.M_dim), stride=(self.M_dim, 1)))
-        gB = cute.make_tensor(x.iterator, cute.make_layout((self.K_dim, self.N_dim), stride=(self.N_dim, 1)))
-        gO = cute.make_tensor(grad_weight.iterator, cute.make_layout((self.M_dim, self.N_dim), stride=(self.N_dim, 1)))
+        gB = cute.make_tensor(x.iterator, cute.make_layout((x.shape[0], self.N_dim), stride=(self.N_dim, 1)))
         
         # Make TMA load descriptors
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp()
-        
-        tma_atom_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
-            tma_load_op,
-            gA,
-            cute.make_layout((self.BLOCK_K_STAGE, self.BLOCK_M), stride=(self.BLOCK_M, 1)),
-            (self.BLOCK_K_STAGE, self.BLOCK_M)
-        )
         
         tma_atom_b, tma_tensor_b = cpasync.make_tiled_tma_atom(
             tma_load_op,
@@ -449,7 +538,7 @@ class GemmBwdDwCute:
         swizzled_grid_x = cute.ceil_div(grid_x_blocks, swizzle_x) * swizzle_x
         
         self.kernel(
-            grad_output_t, x, grad_weight,
+            grad_q, grad_k, grad_v, x, grad_weight,
             self.tiled_mma,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -457,8 +546,11 @@ class GemmBwdDwCute:
             self.b_smem_layout_staged_row,
             self.epi_smem_layout,
             self.copy_atom_r2s,
-            tma_atom_a, tma_tensor_a,
             tma_atom_b, tma_tensor_b,
+            self.gmem_tiled_copy_8,
+            int(self.q_strides[0]), int(self.q_strides[1]), int(self.q_strides[2]),
+            int(self.k_strides[0]), int(self.k_strides[1]), int(self.k_strides[2]),
+            int(self.v_strides[0]), int(self.v_strides[1]), int(self.v_strides[2]),
             Boolean(True)
         ).launch(
             grid=[swizzled_grid_x, cute.ceil_div(self.N_dim, self.BLOCK_N), self.SPLIT_K],
@@ -469,7 +561,9 @@ class GemmBwdDwCute:
     @cute.kernel
     def kernel(
         self,
-        grad_output_t: cute.Tensor,
+        grad_q: cute.Tensor,
+        grad_k: cute.Tensor,
+        grad_v: cute.Tensor,
         x: cute.Tensor,
         grad_weight: cute.Tensor,
         tiled_mma: cute.TiledMma,
@@ -479,10 +573,12 @@ class GemmBwdDwCute:
         b_smem_layout_row: cute.Layout,
         epi_smem_layout: cute.Layout,
         copy_atom_r2s: cute.CopyAtom,
-        tma_atom_a: cute.CopyAtom,
-        tma_tensor_a: cute.Tensor,
         tma_atom_b: cute.CopyAtom,
         tma_tensor_b: cute.Tensor,
+        gmem_tiled_copy_8: cute.TiledCopy,
+        q_stride_0: int, q_stride_1: int, q_stride_2: int,
+        k_stride_0: int, k_stride_1: int, k_stride_2: int,
+        v_stride_0: int, v_stride_1: int, v_stride_2: int,
         use_sync_in_loop: Boolean
     ):
         grid_dim_x = cute.arch.grid_dim()[0]
@@ -491,6 +587,7 @@ class GemmBwdDwCute:
         block_idx_y = cute.arch.block_idx()[1]
         block_idx_z = cute.arch.block_idx()[2]
         tidx, _, _ = cute.arch.thread_idx()
+        num_threads = self.num_warps * 32
         
         # 2D Grid Swizzling with compile-time constant group size
         swizzle_x = 8
@@ -508,17 +605,18 @@ class GemmBwdDwCute:
         actual_grid_dim_x = cute.ceil_div(M_dim, self.BLOCK_M)
         is_valid = cta_m_raw < actual_grid_dim_x
         cta_m = cutlass.min(cta_m_raw, actual_grid_dim_x - 1)
-        M_dim = self.M_dim
-        K_dim = self.K_dim
+        
+        B = self.B
+        N = self.N
+        K_dim = B * N
         N_dim = self.N_dim
         
-        k_tile_cnt = self.k_tile_cnt
+        k_tile_cnt = K_dim // self.BLOCK_K_STAGE
         k_tiles_per_slice = (k_tile_cnt + self.SPLIT_K - 1) // self.SPLIT_K
         k_tile_start = block_idx_z * k_tiles_per_slice
         
         # Prefetch TMA descriptors
         if tidx == 0:
-            cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
             
         smem = cutlass.utils.SmemAllocator()
@@ -548,17 +646,6 @@ class GemmBwdDwCute:
         rA_1 = tiled_mma.make_fragment_A(tCsX[None, None, None, 0])
         rB_1 = tiled_mma.make_fragment_B(tCsW[None, None, None, 0])
         
-        # Partition global tensors inside kernel
-        gA_tile = cute.local_tile(tma_tensor_a, (self.BLOCK_K_STAGE, self.BLOCK_M), (None, cta_m))
-        copy_A, _, _ = copy_utils.tma_get_copy_fn(
-            tma_atom_a,
-            cta_coord=0,
-            cta_layout=cute.make_layout(1),
-            src_tensor=gA_tile,
-            dst_tensor=sX_aligned_row,
-            single_stage=False
-        )
-        
         gB_tile = cute.local_tile(tma_tensor_b, (self.BLOCK_K_STAGE, self.BLOCK_N), (None, cta_n))
         copy_B, _, _ = copy_utils.tma_get_copy_fn(
             tma_atom_b,
@@ -577,17 +664,61 @@ class GemmBwdDwCute:
             
         cute.arch.sync_threads()
         
+        m_start = cta_m * self.BLOCK_M
+        qkv_idx = m_start // (self.NUM_HEADS * self.HEAD_DIM)
+        m_start_rel = m_start % (self.NUM_HEADS * self.HEAD_DIM)
+        
         # Prefetch initial stages
         for stage in cutlass.range_constexpr(self.ab_stage - 1):
             if stage < k_tiles_per_slice:
                 k_curr = cutlass.min(k_tile_start + stage, k_tile_cnt - 1)
                 if tidx < 32:
                     if tidx == 0:
-                        tx_bytes = (self.BLOCK_M * self.BLOCK_K_STAGE * 2) + (self.BLOCK_N * self.BLOCK_K_STAGE * 2)
+                        tx_bytes = self.BLOCK_N * self.BLOCK_K_STAGE * 2
                         cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr + stage, tx_bytes)
                     cute.arch.sync_warp()
-                    copy_A(k_curr, stage, tma_bar_ptr=mbar_ptr + stage)
                     copy_B(k_curr, stage, tma_bar_ptr=mbar_ptr + stage)
+                    
+                # Vectorized zero-copy load of A
+                k_start = k_curr * self.BLOCK_K_STAGE
+                threads_x_A = self.BLOCK_M // 8
+                threads_y_A = num_threads // threads_x_A
+                ty_A = tidx // threads_x_A
+                tx_A = tidx % threads_x_A
+                rows_per_thread_A = self.BLOCK_K_STAGE // threads_y_A
+                
+                for r_idx in cutlass.range(rows_per_thread_A, unroll_full=True):
+                    row = ty_A + r_idx * threads_y_A
+                    col = tx_A * 8
+                    k_global = k_start + row
+                    s_dst = cute.make_tensor((sX_aligned_row.iterator + (stage * self.BLOCK_M * self.BLOCK_K_STAGE + row * self.BLOCK_M + col)).align(16), cute.make_layout((8,)))
+                    
+                    if k_global < K_dim:
+                        b = k_global // N
+                        n = k_global % N
+                        m_global_rel = m_start_rel + col
+                        if m_global_rel < self.NUM_HEADS * self.HEAD_DIM:
+                            h = m_global_rel // self.HEAD_DIM
+                            d = m_global_rel % self.HEAD_DIM
+                            
+                            if qkv_idx == 0:
+                                offset = b * q_stride_0 + h * q_stride_1 + n * q_stride_2 + d
+                                g_src = cute.make_tensor((grad_q.iterator + offset).align(16), cute.make_layout((8,)))
+                                cute.copy(gmem_tiled_copy_8, g_src, s_dst)
+                            elif qkv_idx == 1:
+                                offset = b * k_stride_0 + h * k_stride_1 + n * k_stride_2 + d
+                                g_src = cute.make_tensor((grad_k.iterator + offset).align(16), cute.make_layout((8,)))
+                                cute.copy(gmem_tiled_copy_8, g_src, s_dst)
+                            else:
+                                offset = b * v_stride_0 + h * v_stride_1 + n * v_stride_2 + d
+                                g_src = cute.make_tensor((grad_v.iterator + offset).align(16), cute.make_layout((8,)))
+                                cute.copy(gmem_tiled_copy_8, g_src, s_dst)
+                        else:
+                            for j in cutlass.range(8, unroll_full=True):
+                                s_dst[j] = BFloat16(0.0)
+                    else:
+                        for j in cutlass.range(8, unroll_full=True):
+                            s_dst[j] = BFloat16(0.0)
                     
         # Wait for stage 0 and prefetch to registers
         if k_tiles_per_slice > 0:
@@ -600,7 +731,7 @@ class GemmBwdDwCute:
             cute.autovec_copy(tCsB_init, rB_0)
             
         # Main execution loop
-        for step in cutlass.range_constexpr(k_tiles_per_slice):
+        for step in cutlass.range(k_tiles_per_slice):
             pipe_read = step % self.ab_stage
             pipe_write = (step + self.ab_stage - 1) % self.ab_stage
             next_pipe_read = (step + 1) % self.ab_stage
@@ -610,18 +741,57 @@ class GemmBwdDwCute:
                 k_curr = cutlass.min(k_tile_start + next_gmem_read, k_tile_cnt - 1)
                 if tidx < 32:
                     if tidx == 0:
-                        tx_bytes = (self.BLOCK_M * self.BLOCK_K_STAGE * 2) + (self.BLOCK_N * self.BLOCK_K_STAGE * 2)
+                        tx_bytes = self.BLOCK_N * self.BLOCK_K_STAGE * 2
                         cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr + pipe_write, tx_bytes)
                     cute.arch.sync_warp()
-                    copy_A(k_curr, pipe_write, tma_bar_ptr=mbar_ptr + pipe_write)
                     copy_B(k_curr, pipe_write, tma_bar_ptr=mbar_ptr + pipe_write)
+                    
+                # Vectorized zero-copy load of A
+                k_start = k_curr * self.BLOCK_K_STAGE
+                threads_x_A = self.BLOCK_M // 8
+                threads_y_A = num_threads // threads_x_A
+                ty_A = tidx // threads_x_A
+                tx_A = tidx % threads_x_A
+                rows_per_thread_A = self.BLOCK_K_STAGE // threads_y_A
+                
+                for r_idx in cutlass.range(rows_per_thread_A, unroll_full=True):
+                    row = ty_A + r_idx * threads_y_A
+                    col = tx_A * 8
+                    k_global = k_start + row
+                    s_dst = cute.make_tensor((sX_aligned_row.iterator + (pipe_write * self.BLOCK_M * self.BLOCK_K_STAGE + row * self.BLOCK_M + col)).align(16), cute.make_layout((8,)))
+                    
+                    if k_global < K_dim:
+                        b = k_global // N
+                        n = k_global % N
+                        m_global_rel = m_start_rel + col
+                        if m_global_rel < self.NUM_HEADS * self.HEAD_DIM:
+                            h = m_global_rel // self.HEAD_DIM
+                            d = m_global_rel % self.HEAD_DIM
+                            
+                            if qkv_idx == 0:
+                                offset = b * q_stride_0 + h * q_stride_1 + n * q_stride_2 + d
+                                g_src = cute.make_tensor((grad_q.iterator + offset).align(16), cute.make_layout((8,)))
+                                cute.copy(gmem_tiled_copy_8, g_src, s_dst)
+                            elif qkv_idx == 1:
+                                offset = b * k_stride_0 + h * k_stride_1 + n * k_stride_2 + d
+                                g_src = cute.make_tensor((grad_k.iterator + offset).align(16), cute.make_layout((8,)))
+                                cute.copy(gmem_tiled_copy_8, g_src, s_dst)
+                            else:
+                                offset = b * v_stride_0 + h * v_stride_1 + n * v_stride_2 + d
+                                g_src = cute.make_tensor((grad_v.iterator + offset).align(16), cute.make_layout((8,)))
+                                cute.copy(gmem_tiled_copy_8, g_src, s_dst)
+                        else:
+                            for j in cutlass.range(8, unroll_full=True):
+                                s_dst[j] = BFloat16(0.0)
+                    else:
+                        for j in cutlass.range(8, unroll_full=True):
+                            s_dst[j] = BFloat16(0.0)
                     
             # Prefetch next stage's registers
             if step + 1 < k_tiles_per_slice:
                 next_phase = ((step + 1) // self.ab_stage) % 2
                 cute.arch.mbarrier_wait(mbar_ptr + next_pipe_read, next_phase)
-                if use_sync_in_loop:
-                    cute.arch.sync_threads()
+                cute.arch.sync_threads()
                     
                 tCsA_next = tCsX[None, None, None, next_pipe_read]
                 tCsB_next = tCsW[None, None, None, next_pipe_read]
@@ -644,73 +814,100 @@ class GemmBwdDwCute:
         cute.copy(copy_atom_r2s, accum, tCsC)
         cute.arch.sync_threads()
         
-        # Epilogue atomic reduction store in global memory
-        r = tidx % self.BLOCK_M
-        c = tidx // self.BLOCK_M
+        # Thread mapping for coalesced stores
+        threads_col = self.BLOCK_N
+        threads_row = num_threads // threads_col
         
-        cols_per_thread = self.BLOCK_N // (self.num_warps * 32 // self.BLOCK_M)
-        col_start = c * cols_per_thread
+        t_row = tidx // threads_col
+        t_col = tidx % threads_col
+        
+        rows_per_thread = self.BLOCK_M // threads_row
+        row_start = t_row * rows_per_thread
         
         if is_valid:
-            for col in cutlass.range(cols_per_thread, unroll_full=True):
-                curr_col = cta_n * self.BLOCK_N + col_start + col
-                curr_row = cta_m * self.BLOCK_M + r
+            for r_idx in cutlass.range(rows_per_thread):
+                curr_row = cta_m * self.BLOCK_M + row_start + r_idx
+                curr_col = cta_n * self.BLOCK_N + t_col
                 if curr_row < M_dim and curr_col < N_dim:
-                    val = smem_accum[r, col_start + col]
+                    val = smem_accum[row_start + r_idx, t_col]
                     g_ptr = grad_weight.iterator + curr_row * N_dim + curr_col
-                    cute.arch.atomic_add(g_ptr, val)
+                    if self.SPLIT_K > 1:
+                        cute.arch.atomic_add(g_ptr, val)
+                    else:
+                        g_ptr[0] = val
 
 
 _dx_compile_cache = {}
 _dw_compile_cache = {}
 
-def get_matmul_bwd_dx_kernel(num_warps=4, BLOCK_M=64, BLOCK_N=64, BLOCK_K_STAGE=32, ab_stage=3, K_dim=3072, N_dim=512, maxrregcount=255):
-    key = (num_warps, BLOCK_M, BLOCK_N, BLOCK_K_STAGE, ab_stage, K_dim, N_dim, maxrregcount)
+def get_matmul_bwd_dx_kernel(num_warps=4, BLOCK_M=64, BLOCK_N=64, BLOCK_K_STAGE=32, ab_stage=3, B=32, N=512, K_dim=3072, N_dim=512, NUM_HEADS=16, HEAD_DIM=64, q_strides=None, k_strides=None, v_strides=None, maxrregcount=255):
+    key = (num_warps, BLOCK_M, BLOCK_N, BLOCK_K_STAGE, ab_stage, B, N, K_dim, N_dim, NUM_HEADS, HEAD_DIM, tuple(q_strides), tuple(k_strides), tuple(v_strides), maxrregcount)
     if key not in _dx_compile_cache:
-        M_sym = cute.sym_int()
-        
         op = GemmBwdDxCute(
             num_warps=num_warps,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             BLOCK_K_STAGE=BLOCK_K_STAGE,
             ab_stage=ab_stage,
-            M_dim=M_sym,
+            B=B,
+            N=N,
             K_dim=K_dim,
-            N_dim=N_dim
+            N_dim=N_dim,
+            NUM_HEADS=NUM_HEADS,
+            HEAD_DIM=HEAD_DIM,
+            q_strides=q_strides,
+            k_strides=k_strides,
+            v_strides=v_strides
         )
         
-        grad_output_fake = make_fake_tensor(BFloat16, (M_sym, K_dim), 16)
+        grad_q_fake = make_fake_tensor(BFloat16, (B, NUM_HEADS, N, HEAD_DIM), 16)
+        grad_k_fake = make_fake_tensor(BFloat16, (B, NUM_HEADS, N, HEAD_DIM), 16)
+        grad_v_fake = make_fake_tensor(BFloat16, (B, NUM_HEADS, N, HEAD_DIM), 16)
         weight_fake = make_fake_tensor(BFloat16, (K_dim, N_dim), 16)
-        grad_x_fake = make_fake_tensor(BFloat16, (M_sym, N_dim), 16)
+        grad_x_fake = make_fake_tensor(BFloat16, (B * N, N_dim), 16)
         
         fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         
         compiled_fn = cute.compile(
             op,
-            grad_output_fake, weight_fake, grad_x_fake,
+            grad_q_fake, grad_k_fake, grad_v_fake, weight_fake, grad_x_fake,
             fake_stream,
             options=f"--enable-tvm-ffi --opt-level 3 --ptxas-options '-O3 -v --maxrregcount={maxrregcount}'",
         )
         _dx_compile_cache[key] = compiled_fn
     return _dx_compile_cache[key]
 
-def get_matmul_bwd_dw_kernel(num_warps=4, BLOCK_M=64, BLOCK_N=64, BLOCK_K_STAGE=32, ab_stage=3, M_dim=3072, K_dim=512, N_dim=512, maxrregcount=255, SPLIT_K=16):
-    key = (num_warps, BLOCK_M, BLOCK_N, BLOCK_K_STAGE, ab_stage, M_dim, K_dim, N_dim, maxrregcount, SPLIT_K)
+def get_matmul_bwd_dw_kernel(num_warps=4, BLOCK_M=64, BLOCK_N=64, BLOCK_K_STAGE=32, ab_stage=3, B=32, N=512, M_dim=3072, K_dim=512, N_dim=512, NUM_HEADS=16, HEAD_DIM=64, q_strides=None, k_strides=None, v_strides=None, maxrregcount=255, SPLIT_K=1):
+    key = (num_warps, BLOCK_M, BLOCK_N, BLOCK_K_STAGE, ab_stage, B, N, M_dim, K_dim, N_dim, NUM_HEADS, HEAD_DIM, tuple(q_strides), tuple(k_strides), tuple(v_strides), maxrregcount, SPLIT_K)
     if key not in _dw_compile_cache:
+        print("DEBUG JIT COMPILE: get_matmul_bwd_dw_kernel called")
+        print(f"DEBUG: K_dim = {K_dim}, type = {type(K_dim)}")
+        print(f"DEBUG: N_dim = {N_dim}, type = {type(N_dim)}")
+        print(f"DEBUG: M_dim = {M_dim}, type = {type(M_dim)}")
+        
         op = GemmBwdDwCute(
             num_warps=num_warps,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             BLOCK_K_STAGE=BLOCK_K_STAGE,
             ab_stage=ab_stage,
+            B=B,
+            N=N,
             M_dim=M_dim,
             K_dim=K_dim,
             N_dim=N_dim,
+            NUM_HEADS=NUM_HEADS,
+            HEAD_DIM=HEAD_DIM,
+            q_strides=q_strides,
+            k_strides=k_strides,
+            v_strides=v_strides,
             SPLIT_K=SPLIT_K
         )
+        print(f"DEBUG: op.K_dim set to = {op.K_dim}, type = {type(op.K_dim)}")
         
-        grad_output_t_fake = make_fake_tensor(BFloat16, (M_dim, K_dim), 16, leading_dim=0)
+        grad_q_fake = make_fake_tensor(BFloat16, (B, NUM_HEADS, N, HEAD_DIM), 16)
+        grad_k_fake = make_fake_tensor(BFloat16, (B, NUM_HEADS, N, HEAD_DIM), 16)
+        grad_v_fake = make_fake_tensor(BFloat16, (B, NUM_HEADS, N, HEAD_DIM), 16)
         x_fake = make_fake_tensor(BFloat16, (K_dim, N_dim), 16)
         grad_weight_fake = make_fake_tensor(Float32, (M_dim, N_dim), 16)
         
@@ -718,7 +915,7 @@ def get_matmul_bwd_dw_kernel(num_warps=4, BLOCK_M=64, BLOCK_N=64, BLOCK_K_STAGE=
         
         compiled_fn = cute.compile(
             op,
-            grad_output_t_fake, x_fake, grad_weight_fake,
+            grad_q_fake, grad_k_fake, grad_v_fake, x_fake, grad_weight_fake,
             fake_stream,
             options=f"--enable-tvm-ffi --opt-level 3 --ptxas-options '-O3 -v --maxrregcount={maxrregcount}'",
         )
@@ -727,20 +924,25 @@ def get_matmul_bwd_dw_kernel(num_warps=4, BLOCK_M=64, BLOCK_N=64, BLOCK_K_STAGE=
 
 @torch.library.custom_op("flash_prologue::matmul_bwd_dx_cute", mutates_args=())
 def matmul_bwd_dx(
-    grad_output: torch.Tensor,
+    grad_q: torch.Tensor,
+    grad_k: torch.Tensor,
+    grad_v: torch.Tensor,
     weight: torch.Tensor
 ) -> torch.Tensor:
-    M_dim, K_dim = grad_output.shape
-    K_dim2, N_dim = weight.shape
-    assert K_dim == K_dim2, "Dimension mismatch for dx"
+    B, NUM_HEADS, N, HEAD_DIM = grad_q.shape
+    M_dim = B * N
+    K_dim = 3 * NUM_HEADS * HEAD_DIM
+    N_dim = weight.shape[1]
     
-    grad_output_bf16 = grad_output.to(torch.bfloat16).contiguous()
+    grad_q_bf16 = grad_q.to(torch.bfloat16)
+    grad_k_bf16 = grad_k.to(torch.bfloat16)
+    grad_v_bf16 = grad_v.to(torch.bfloat16)
     weight_bf16 = weight.to(torch.bfloat16).contiguous()
     
-    grad_x = torch.empty((M_dim, N_dim), dtype=torch.bfloat16, device=grad_output.device)
+    grad_x = torch.empty((M_dim, N_dim), dtype=torch.bfloat16, device=grad_q.device)
     
     from flash_attn_prologue.autotune import get_autotuned_config
-    config = get_autotuned_config(M_dim, N_dim, K_dim, "bwd_dx", device=str(grad_output.device))
+    config = get_autotuned_config(M_dim, N_dim, K_dim, "bwd_dx", device=str(grad_q.device))
     
     block_m = config["BLOCK_M"]
     block_n = config["BLOCK_N"]
@@ -755,37 +957,51 @@ def matmul_bwd_dx(
         BLOCK_N=block_n,
         BLOCK_K_STAGE=block_k,
         ab_stage=ab_stage,
+        B=B,
+        N=N,
         K_dim=K_dim,
         N_dim=N_dim,
+        NUM_HEADS=NUM_HEADS,
+        HEAD_DIM=HEAD_DIM,
+        q_strides=grad_q.stride(),
+        k_strides=grad_k.stride(),
+        v_strides=grad_v.stride(),
         maxrregcount=maxrregcount
     )
     
-    kernel(grad_output_bf16, weight_bf16, grad_x)
+    kernel(grad_q_bf16, grad_k_bf16, grad_v_bf16, weight_bf16, grad_x)
     return grad_x
 
 @matmul_bwd_dx.register_fake
-def _matmul_bwd_dx_fake(grad_output, weight):
-    M_dim, _ = grad_output.shape
+def _matmul_bwd_dx_fake(grad_q, grad_k, grad_v, weight):
+    B, _, N, _ = grad_q.shape
+    M_dim = B * N
     _, N_dim = weight.shape
-    return torch.empty((M_dim, N_dim), dtype=grad_output.dtype, device=grad_output.device)
+    return torch.empty((M_dim, N_dim), dtype=grad_q.dtype, device=grad_q.device)
 
 @torch.library.custom_op("flash_prologue::matmul_bwd_dw_cute", mutates_args=())
 def matmul_bwd_dw(
-    grad_output_t: torch.Tensor,
+    grad_q: torch.Tensor,
+    grad_k: torch.Tensor,
+    grad_v: torch.Tensor,
     x: torch.Tensor
 ) -> torch.Tensor:
-    M_dim, K_dim = grad_output_t.shape
-    K_dim2, N_dim = x.shape
-    assert K_dim == K_dim2, "Dimension mismatch for dw"
+    B, NUM_HEADS, N, HEAD_DIM = grad_q.shape
+    M_dim = 3 * NUM_HEADS * HEAD_DIM
+    K_dim = B * N
+    N_dim = x.shape[2] if x.dim() == 3 else x.shape[1] # handles both 3D [B, N, D] and 2D [B*N, D]
     
-    grad_output_t_bf16 = grad_output_t.to(torch.bfloat16)
-    x_bf16 = x.to(torch.bfloat16).contiguous()
+    grad_q_bf16 = grad_q.to(torch.bfloat16)
+    grad_k_bf16 = grad_k.to(torch.bfloat16)
+    grad_v_bf16 = grad_v.to(torch.bfloat16)
+    
+    x_flat = x.reshape(K_dim, N_dim).to(torch.bfloat16).contiguous()
     
     # Initialize output tensor as Float32 zeros for Split-K atomic accumulations
-    grad_weight = torch.zeros((M_dim, N_dim), dtype=torch.float32, device=grad_output_t.device)
+    grad_weight = torch.zeros((M_dim, N_dim), dtype=torch.float32, device=grad_q.device)
     
     from flash_attn_prologue.autotune import get_autotuned_config
-    config = get_autotuned_config(M_dim, N_dim, K_dim, "bwd_dw", device=str(grad_output_t.device))
+    config = get_autotuned_config(M_dim, N_dim, K_dim, "bwd_dw", device=str(grad_q.device))
     
     block_m = config["BLOCK_M"]
     block_n = config["BLOCK_N"]
@@ -800,18 +1016,26 @@ def matmul_bwd_dw(
         BLOCK_N=block_n,
         BLOCK_K_STAGE=block_k,
         ab_stage=ab_stage,
+        B=B,
+        N=N,
         M_dim=M_dim,
         K_dim=K_dim,
         N_dim=N_dim,
+        NUM_HEADS=NUM_HEADS,
+        HEAD_DIM=HEAD_DIM,
+        q_strides=grad_q.stride(),
+        k_strides=grad_k.stride(),
+        v_strides=grad_v.stride(),
         maxrregcount=maxrregcount,
-        SPLIT_K=16
+        SPLIT_K=1
     )
     
-    kernel(grad_output_t_bf16, x_bf16, grad_weight)
+    kernel(grad_q_bf16, grad_k_bf16, grad_v_bf16, x_flat, grad_weight)
     return grad_weight.to(torch.bfloat16)
 
 @matmul_bwd_dw.register_fake
-def _matmul_bwd_dw_fake(grad_output_t, x):
-    M_dim, _ = grad_output_t.shape
-    _, N_dim = x.shape
-    return torch.empty((M_dim, N_dim), dtype=grad_output_t.dtype, device=grad_output_t.device)
+def _matmul_bwd_dw_fake(grad_q, grad_k, grad_v, x):
+    B, NUM_HEADS, N, HEAD_DIM = grad_q.shape
+    M_dim = 3 * NUM_HEADS * HEAD_DIM
+    N_dim = x.shape[2] if x.dim() == 3 else x.shape[1]
+    return torch.empty((M_dim, N_dim), dtype=grad_q.dtype, device=grad_q.device)

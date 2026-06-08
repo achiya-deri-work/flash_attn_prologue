@@ -71,21 +71,7 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
     elif mode in ("bwd_dx", "bwd_dw"):
         candidates = []
         if mode == "bwd_dx":
-            # For dx, symmetric block shape 128x128 is correct and performant.
-            # Avoid asymmetric block shapes or smaller 64x64 shapes to prevent layout corruption or race conditions.
-            for block_size in [128]:
-                for bk in [32, 64]:
-                    for regs in [255]:
-                        candidates.append({
-                            "BLOCK_M": block_size,
-                            "BLOCK_N": block_size,
-                            "BLOCK_K": bk,
-                            "ab_stage": 3,
-                            "num_warps": 4,
-                            "maxrregcount": regs
-                        })
-        else: # mode == "bwd_dw"
-            # For dw, 128x128x32 is correct and performant under Split-K.
+            # dx requires 128x128 and ab_stage = 3 to avoid Write-After-Read race conditions / NaNs
             candidates.append({
                 "BLOCK_M": 128,
                 "BLOCK_N": 128,
@@ -94,6 +80,20 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                 "num_warps": 4,
                 "maxrregcount": 255
             })
+        else: # bwd_dw
+            # Support symmetric block sizes 64x64 and 128x128 with 2 or 3 stages
+            for block_size in [64, 128]:
+                for bk in [32]:
+                    for stage in [2, 3]:
+                        for regs in [255]:
+                            candidates.append({
+                                "BLOCK_M": block_size,
+                                "BLOCK_N": block_size,
+                                "BLOCK_K": bk,
+                                "ab_stage": stage,
+                                "num_warps": 4,
+                                "maxrregcount": regs
+                            })
     elif mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
         candidates = []
         for hg in [1, 2, 4, 8]:
@@ -427,30 +427,40 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                 if prof_M % bm != 0 or prof_N % bn != 0:
                     continue
                     
+                B_prof = 32
+                N_seq_prof = 512
+                
+                grad_q_prof = torch.randn(B_prof, 16, N_seq_prof, 64, device=device, dtype=torch.bfloat16)
+                grad_k_prof = torch.randn(B_prof, 16, N_seq_prof, 64, device=device, dtype=torch.bfloat16)
+                grad_v_prof = torch.randn(B_prof, 16, N_seq_prof, 64, device=device, dtype=torch.bfloat16)
+                weight_prof = torch.randn(prof_K, prof_N, device=device, dtype=torch.bfloat16)
+                grad_x_prof = torch.empty(prof_M, prof_N, device=device, dtype=torch.bfloat16)
+                
                 dx_kernel = get_matmul_bwd_dx_kernel(
                     num_warps=warps,
                     BLOCK_M=bm,
                     BLOCK_N=bn,
                     BLOCK_K_STAGE=bk,
                     ab_stage=stage,
+                    B=B_prof,
+                    N=N_seq_prof,
                     K_dim=prof_K,
                     N_dim=prof_N,
+                    q_strides=grad_q_prof.stride(),
+                    k_strides=grad_k_prof.stride(),
+                    v_strides=grad_v_prof.stride(),
                     maxrregcount=regs
                 )
                 
-                grad_output_prof = torch.randn(prof_M, prof_K, device=device, dtype=torch.bfloat16)
-                weight_prof = torch.randn(prof_K, prof_N, device=device, dtype=torch.bfloat16)
-                grad_x_prof = torch.empty(prof_M, prof_N, device=device, dtype=torch.bfloat16)
-                
                 for _ in range(3):
-                    dx_kernel(grad_output_prof, weight_prof, grad_x_prof)
+                    dx_kernel(grad_q_prof, grad_k_prof, grad_v_prof, weight_prof, grad_x_prof)
                 torch.cuda.synchronize()
                 
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
                 start_event.record()
                 for _ in range(15):
-                    dx_kernel(grad_output_prof, weight_prof, grad_x_prof)
+                    dx_kernel(grad_q_prof, grad_k_prof, grad_v_prof, weight_prof, grad_x_prof)
                 end_event.record()
                 torch.cuda.synchronize()
                 curr_ms = start_event.elapsed_time(end_event) / 15.0
@@ -464,32 +474,42 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                 if prof_M % bm != 0 or prof_N % bn != 0:
                     continue
                     
+                B_prof = 32
+                N_seq_prof = 512
+                
+                grad_q_prof = torch.randn(B_prof, 16, N_seq_prof, 64, device=device, dtype=torch.bfloat16)
+                grad_k_prof = torch.randn(B_prof, 16, N_seq_prof, 64, device=device, dtype=torch.bfloat16)
+                grad_v_prof = torch.randn(B_prof, 16, N_seq_prof, 64, device=device, dtype=torch.bfloat16)
+                x_prof = torch.randn(prof_K, prof_N, device=device, dtype=torch.bfloat16)
+                grad_weight_prof = torch.zeros(prof_M, prof_N, device=device, dtype=torch.float32)
+                
                 dw_kernel = get_matmul_bwd_dw_kernel(
                     num_warps=warps,
                     BLOCK_M=bm,
                     BLOCK_N=bn,
                     BLOCK_K_STAGE=bk,
                     ab_stage=stage,
+                    B=B_prof,
+                    N=N_seq_prof,
                     M_dim=prof_M,
                     K_dim=prof_K,
                     N_dim=prof_N,
+                    q_strides=grad_q_prof.stride(),
+                    k_strides=grad_k_prof.stride(),
+                    v_strides=grad_v_prof.stride(),
                     maxrregcount=regs,
-                    SPLIT_K=16
+                    SPLIT_K=1
                 )
                 
-                grad_output_t_prof = torch.randn(prof_K, prof_M, device=device, dtype=torch.bfloat16).t()
-                x_prof = torch.randn(prof_K, prof_N, device=device, dtype=torch.bfloat16)
-                grad_weight_prof = torch.zeros(prof_M, prof_N, device=device, dtype=torch.float32)
-                
                 for _ in range(3):
-                    dw_kernel(grad_output_t_prof, x_prof, grad_weight_prof)
+                    dw_kernel(grad_q_prof, grad_k_prof, grad_v_prof, x_prof, grad_weight_prof)
                 torch.cuda.synchronize()
                 
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
                 start_event.record()
                 for _ in range(15):
-                    dw_kernel(grad_output_t_prof, x_prof, grad_weight_prof)
+                    dw_kernel(grad_q_prof, grad_k_prof, grad_v_prof, x_prof, grad_weight_prof)
                 end_event.record()
                 torch.cuda.synchronize()
                 curr_ms = start_event.elapsed_time(end_event) / 15.0

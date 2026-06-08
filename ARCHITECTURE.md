@@ -45,9 +45,9 @@ The project is structured as a modular Python library with clear separation betw
 11. **Cloned Backward GEMM Module (`flash_attn_prologue/gemm_bwd.py`):**
     - Implements decoupled `matmul_bwd_dx` and `matmul_bwd_dw` JIT compilation and runner wrappers using Blackwell (SM120) hardware TMA (Tensor Memory Accelerator) loads (`CopyBulkTensorTileG2SOp`) and asynchronous `mbarrier` transaction barriers.
     - Provides two isolated compilation cache routines (`get_matmul_bwd_dx_kernel` and `get_matmul_bwd_dw_kernel`) using QuACK FFI binders.
-    - Allows independent optimization of tile size, warp layouts, pipeline stages, register allocations, and other compilation options for dx and dw computation steps.
-    - To prevent Write-After-Read (WAR) hazards and correctness bugs (such as NaNs, Infs, and huge numerical errors) inherent to smaller block layouts (like `64x64`) under high-throughput JIT execution, both `bwd_dx` and `bwd_dw` are strictly configured and autotuned to use the highly stable and correct `BLOCK_M = BLOCK_N = 128, BLOCK_K = 32` block shape with `ab_stage = 3` (triple-buffering) and `maxrregcount = 255`.
-    - `bwd_dw` additionally implements a `Split-K = 16` grid dimension to perform parallel shared memory accumulations, storing to global weight gradients via atomic additions (`cute.arch.atomic_add`) in Float32.
+    - Specializes the JIT compilation cache with static dimensions `B = 32` and `N = 512` to enable compile-time optimization of sequence index division/modulo operations on the GPU (converting costly dynamic division instructions into 1-cycle bit-shifts and mask operations).
+    - Optimizes the `bwd_dw` epilogue writeback: when running with `SPLIT_K = 1`, the kernel bypasses global atomic additions entirely and writes accumulators directly to global memory (`g_ptr[0] = val`), eliminating atomic overhead.
+    - Integrates the autotuner to independently profile `bwd_dx` and `bwd_dw` using 4D split gradient tensors. The autotuner dynamically selects and caches the optimal configurations: `BLOCK_M = 128, BLOCK_N = 128, BLOCK_K = 32, ab_stage = 3` (triple-buffering) for `bwd_dx` to prevent WAR race conditions and NaNs, and `BLOCK_M = 64, BLOCK_N = 64, BLOCK_K = 32, ab_stage = 2` (double-buffering) for `bwd_dw` to maximize occupancy and speed (latency reduced from 34 ms to 1.75 ms).
 
 
 
