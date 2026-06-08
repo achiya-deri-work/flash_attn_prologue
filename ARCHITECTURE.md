@@ -46,8 +46,19 @@ The project is structured as a modular Python library with clear separation betw
     - Implements decoupled `matmul_bwd_dx` and `matmul_bwd_dw` JIT compilation and runner wrappers using Blackwell (SM120) hardware TMA (Tensor Memory Accelerator) loads (`CopyBulkTensorTileG2SOp`) and asynchronous `mbarrier` transaction barriers.
     - Provides two isolated compilation cache routines (`get_matmul_bwd_dx_kernel` and `get_matmul_bwd_dw_kernel`) using QuACK FFI binders.
     - Specializes the JIT compilation cache with static dimensions `B = 32` and `N = 512` to enable compile-time optimization of sequence index division/modulo operations on the GPU (converting costly dynamic division instructions into 1-cycle bit-shifts and mask operations).
-    - Optimizes the `bwd_dw` epilogue writeback: implements a Two-Pass Workspace Reduction when `SPLIT_K > 1`, where blocks write their partial accumulations directly into unique slices of a Float32 global memory workspace (eliminating global atomic contention) followed by a compiled sum reduction. Standard direct coalesced stores are used when `SPLIT_K = 1`.
-    - Integrates the autotuner to independently profile `bwd_dx` and `bwd_dw` using 4D split gradient tensors. The autotuner dynamically selects and caches the optimal configurations: `BLOCK_M = 128, BLOCK_N = 128, BLOCK_K = 32, ab_stage = 3` (triple-buffering) for `bwd_dx` to prevent WAR race conditions and NaNs, and `BLOCK_M = 64, BLOCK_N = 64, BLOCK_K = 32, ab_stage = 3` with `SPLIT_K = 8` using the workspace reduction for `bwd_dw` to maximize parallel execution occupancy and speed.
+    - **Concurrent Component Layouts & Parallel TMA Loads**: Shared memory allocations represent the three components (`Q`, `K`, `V`) contiguously using nested layouts, enabling concurrent loading from split global memory tensors directly into the contiguous SMEM tiles via parallel TMA copies.
+    - **Block-Contiguous Layout Alignment**: Aligned `a_smem_layout_staged` and `a_smem_layout_staged_row` in `GemmBwdDwCute` to use block-contiguous layout strides `stride=((1, BLOCK_M * BLOCK_K_STAGE), BLOCK_M, 3 * BLOCK_M * BLOCK_K_STAGE)` matching the load path exactly, resolving a critical layout mismatch that read incorrect shared memory offsets.
+    - **TMA Coordinate Head-Index Modulo Map**: Corrected batch-head coordinate calculation in both dx and dw kernels to use `b_h = b * self.NUM_HEADS + (h % self.NUM_HEADS)`, preventing out-of-bounds index wrapping.
+    - **Static Contiguous Strides compilation**: Hardcoded static contiguous integer stride tuples `(None, N * HEAD_DIM, HEAD_DIM, 1)` for JIT compilation, ensuring NVCC generates specialized code for contiguous input views and avoiding cache pollution with dynamic strides.
+    - **Concrete Integer Shape Casting (`SymInt` Shield)**: Cast shape inputs (`B`, `N`, `NUM_HEADS`, `HEAD_DIM`, `hidden`, `N_dim`, etc.) to Python concrete `int` in the custom op wrappers, ensuring PyTorch trace-time `SymInt`s do not leak into autotuner configurations or JIT compilation keys.
+    - **Empty Input Guards**: Bypasses JIT kernel execution and returns zero-initialized outputs immediately if `grad_q.numel() == 0` or `x.numel() == 0`, supporting empty sequence boundaries without compiling/launching threads.
+    - **In-place dw Accumulation Custom Op Registration**: To avoid PyTorch autograd output-aliasing errors, registered two distinct ops: `matmul_bwd_dw_cute` (non-mutating) and `matmul_bwd_dw_accumulate_cute` (mutating, `mutates_args={"out"}`). If an output `out` tensor is provided (such as `weight.grad`), the epilogue accumulates in-place directly into it.
+    - **3x Activation Bandwidth Savings**: For `bwd_dw`, activations `x` are loaded exactly once into `sW` while split gradients `grad_q`, `grad_k`, and `grad_v` are loaded in parallel into `sX`, eliminating two out of three global activation loads and saving 3x memory bandwidth.
+    - **Direct BFloat16 Writeback**: For `SPLIT_K = 1` (or the best configurations selected), the epilogue is re-architected to cast Float32 accumulators directly in registers and write BFloat16 values to global memory, completely avoiding intermediate Float32 allocation and PyTorch-side type conversion overhead.
+    - **Workspace Reduction**: When `SPLIT_K > 1`, blocks write their partial accumulations directly into unique slices of a Float32 global memory workspace (eliminating global atomic contention) followed by a compiled sum reduction.
+    - **Autotuner Integration**: Integrates the autotuner with a pruned, highly efficient candidate space to independently profile `bwd_dx` and `bwd_dw`. The autotuner dynamically selects and caches the optimal configurations in `autotune_cache.json`:
+      - `bwd_dx` (shape 16384_512_3072): `BLOCK_M = 64, BLOCK_N = 64, BLOCK_K = 16, ab_stage = 3, num_warps = 4, maxrregcount = 80, swizzle_x = 16, atom_layout_mnk = [1, 4, 1]`.
+      - `bwd_dw` (shape 3072_512_16384): `BLOCK_M = 64, BLOCK_N = 64, BLOCK_K = 32, ab_stage = 3, num_warps = 4, maxrregcount = 255, SPLIT_K = 12, swizzle_x = 1, atom_layout_mnk = [4, 1, 1]`.
 
 
 
@@ -285,12 +296,12 @@ graph TD
   - Peak SMEM utilization is exactly **~68 KB** by aliasing the BFloat16 output buffer `sOut_bf16` with the `smem_accum` buffer, reducing epilogue SMEM requirements from 102 KB (violating the 99 KB limit) to 69.6 KB.
 
 ### 9. Blackwell TMA Pipelined Backward GEMM dw Kernel Map (`bwd_dw`)
-- **Total Active Shared Memory:** **~49.2 KB** (within 99 KB Blackwell limit)
-- **Allocation Details (for optimal config BLOCK_M = 64, BLOCK_N = 128, BLOCK_K = 32, ab_stage = 4, SPLIT_K = 8):**
-  - `sX` (BFloat16, 4 stages): `BLOCK_M * BLOCK_K_STAGE * 4` = `64 * 32 * 4 = 8,192` elements (**16.384 KB**).
-  - `sW` (BFloat16, 4 stages): `BLOCK_N * BLOCK_K_STAGE * 4` = `128 * 32 * 4 = 16,384` elements (**32.768 KB**).
-  - `smem_accum` (Float32, epilogue buffer): `BLOCK_M * BLOCK_N_padded` = `64 * 136 = 8,704` elements (**34.816 KB**).
-  - Peak SMEM utilization is exactly **49.152 KB** (since epilogue memory is aliased with mainloop staged buffers).
+- **Total Active Shared Memory:** **~42.0 KB** (within 99 KB Blackwell limit)
+- **Allocation Details (for optimal config BLOCK_M = 32, BLOCK_N = 128, BLOCK_K = 32, ab_stage = 3, SPLIT_K = 2):**
+  - `sX` (BFloat16, 3 stages, 3 components): `BLOCK_M * BLOCK_K_STAGE * 3 * 3` = `32 * 32 * 3 * 3 = 9,216` elements (**18.432 KB**).
+  - `sW` (BFloat16, 3 stages): `BLOCK_N * BLOCK_K_STAGE * 3` = `128 * 32 * 3 = 12,288` elements (**24.576 KB**).
+  - `smem_accum` (BFloat16, epilogue buffer, 3 components): `3 * BLOCK_M * BLOCK_N_padded` = `3 * 32 * 136 = 13,056` elements (**26.112 KB**).
+  - Peak SMEM utilization is exactly **43.008 KB** (since epilogue memory is aliased with mainloop staged buffers).
 
 ### 10. Thread Block Clusters for L2 Cache Saturation
 - **Cluster Shape:** `cluster=[2, 1, 1]`
@@ -304,6 +315,8 @@ graph TD
 ### 12. Register-Level Cast & Store Epilogue Map
 - **Eliminating Shared Memory Buffers:** In the forward (`fused_qkv.py`) and backward dx (`gemm_bwd.py`) kernels, instead of storing Float32 accumulators to a shared memory buffer, casting them to BFloat16, and copying them out, the accumulators are cast to BFloat16 directly within registers using `cute.make_fragment_like(accum, BFloat16)`.
 - **MMA-Partitioned Coalesced Writes:** The register fragments are written to the partitioned BFloat16 output shared memory buffer `sOut_bf16` using `copy_atom_r2s_bf16`. This design completely eliminates the Float32 shared memory epilogue buffers (saving 48 KB - 98 KB SMEM), reducing dynamic memory pressure and enabling greater block occupancy.
+- **Post-Loop Synchronization Barrier:** Because `sOut_bf16` aliases the same shared memory pointer as `sX` (stage 0), we enforce a threadblock-wide `cute.arch.sync_threads()` immediately after the main loop and before writing to `sOut_bf16`. This prevents Write-After-Read (WAR) race conditions where fast warps overwrite shared memory before slower warps in the same CTA finish their last MMA steps.
+
 
 
 

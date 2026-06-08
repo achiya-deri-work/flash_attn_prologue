@@ -2,6 +2,11 @@ import os
 import torch
 import math
 
+def _ensure_contiguous(t):
+    if torch.compiler.is_compiling():
+        return t.contiguous()
+    return t if t.stride(-1) == 1 else t.contiguous()
+
 # Set architecture target to Blackwell
 os.environ["CUTE_DSL_ARCH"] = "sm_120a"
 os.environ["QUACK_ARCH"] = "sm_120a"
@@ -13,9 +18,10 @@ from cutlass import BFloat16, Float32, Int32, Int64, Boolean, const_expr
 from cutlass.cute.nvgpu import cpasync
 from quack.compile_utils import make_fake_tensor
 from quack import copy_utils
+from flash_attn_prologue.autotune import get_autotuned_config
 
 class FusedQKV:
-    def __init__(self, num_warps: int = 4, BLOCK_M: int = 64, BLOCK_K_STAGE: int = 32, NUM_HEADS: int = 16, HEAD_DIM: int = 64, HEAD_GROUP: int = 2, hidden: int = 512, use_sync_in_loop: bool = True, ab_stage: int = None, swizzle_x: int = 8):
+    def __init__(self, num_warps: int = 4, BLOCK_M: int = 64, BLOCK_K_STAGE: int = 32, NUM_HEADS: int = 16, HEAD_DIM: int = 64, HEAD_GROUP: int = 2, hidden: int = 512, use_sync_in_loop: bool = True, ab_stage: int = None, swizzle_x: int = 8, atom_layout_mnk = None):
         self.num_warps = num_warps  # 4 warps (128 threads)
         self.BLOCK_M = BLOCK_M
         self.HEAD_DIM = HEAD_DIM
@@ -27,6 +33,7 @@ class FusedQKV:
         self.k_tile_cnt = hidden // BLOCK_K_STAGE
         self.use_sync_in_loop = use_sync_in_loop
         self.swizzle_x = swizzle_x
+        self.atom_layout_mnk = atom_layout_mnk
         
         # Calculate shared memory footprint for 3 stages dynamically
         sX_elements_3 = self.BLOCK_M * self.BLOCK_K_STAGE * 3
@@ -38,8 +45,8 @@ class FusedQKV:
         if ab_stage is not None:
             self.ab_stage = ab_stage
         else:
-            # Blackwell hardware SMEM limit is 99 KB
-            if max(mainloop_bytes_3, epilogue_bytes) <= 99 * 1024:
+            # Limit dynamic shared memory to 48 KB to prevent CUDA illegal address / configuration errors
+            if max(mainloop_bytes_3, epilogue_bytes) <= 48 * 1024:
                 self.ab_stage = 3
             else:
                 self.ab_stage = 2
@@ -52,8 +59,8 @@ class FusedQKV:
         # Physical layout of sW: non-interleaved grouped layout
         # (3 components: Q, K, V are stored contiguously in SMEM)
         self.b_smem_layout_staged = cute.make_layout(
-            ((self.HEAD_DIM, 3, self.HEAD_GROUP), self.BLOCK_K_STAGE, self.ab_stage),
-            stride=((self.BLOCK_K_STAGE, self.HEAD_GROUP * self.HEAD_DIM * self.BLOCK_K_STAGE, self.HEAD_DIM * self.BLOCK_K_STAGE), 1, self.BLOCK_N * self.BLOCK_K_STAGE)
+            (self.BLOCK_N, self.BLOCK_K_STAGE, self.ab_stage),
+            stride=(self.BLOCK_K_STAGE, 1, self.BLOCK_N * self.BLOCK_K_STAGE)
         )
         
         # Shared memory layout for epilogue writeback (Float32 view of sBuf)
@@ -80,10 +87,34 @@ class FusedQKV:
         
         # 3. TiledMMA configuration
         self.mma = MmaF16BF16Op(BFloat16, Float32, (16, 8, 16))
-        if self.BLOCK_M == 16:
-            atom_layout_mnk = (1, 4, 1)
+        if self.atom_layout_mnk is not None:
+            atom_layout_mnk = self.atom_layout_mnk
+        elif self.BLOCK_M == 16:
+            if self.num_warps == 4:
+                atom_layout_mnk = (1, 4, 1)
+            elif self.num_warps == 2:
+                atom_layout_mnk = (1, 2, 1)
+            elif self.num_warps == 6:
+                atom_layout_mnk = (1, 6, 1)
+            elif self.num_warps == 8:
+                atom_layout_mnk = (1, 8, 1)
+            else:
+                atom_layout_mnk = (1, self.num_warps, 1)
         else:
-            atom_layout_mnk = (2, 2, 1)
+            if self.num_warps == 4:
+                atom_layout_mnk = (2, 2, 1)
+            elif self.num_warps == 2:
+                atom_layout_mnk = (2, 1, 1)
+            elif self.num_warps == 6:
+                atom_layout_mnk = (3, 2, 1)
+            elif self.num_warps == 8:
+                atom_layout_mnk = (4, 2, 1)
+            elif self.num_warps == 12:
+                atom_layout_mnk = (4, 3, 1)
+            elif self.num_warps == 16:
+                atom_layout_mnk = (4, 4, 1)
+            else:
+                atom_layout_mnk = (self.num_warps, 1, 1)
         self.tiled_mma = cute.make_tiled_mma(self.mma, atom_layout_mnk=atom_layout_mnk)
         
         # 4. Copy atom for Float32 accumulator writeback
@@ -94,11 +125,17 @@ class FusedQKV:
         # 5. TiledCopy configuration for direct-store epilogue
         store_op = cute.nvgpu.CopyUniversalOp()
         store_atom = cute.make_copy_atom(store_op, BFloat16, num_bits_per_copy=128)
-        store_thr_m = min(16, self.BLOCK_M)
-        store_thr_n = (self.num_warps * 32) // store_thr_m
+        self.store_thr_n = self.HEAD_DIM // 8
+        max_thr_m = (self.num_warps * 32) // self.store_thr_n
+        
+        self.store_thr_m = 1
+        for d in range(1, self.BLOCK_M + 1):
+            if self.BLOCK_M % d == 0 and d <= max_thr_m:
+                self.store_thr_m = d
+                
         self.gmem_tiled_copy_store = cute.make_tiled_copy_tv(
             store_atom,
-            cute.make_ordered_layout((store_thr_m, store_thr_n), order=(1, 0)),
+            cute.make_ordered_layout((self.store_thr_m, self.store_thr_n), order=(1, 0)),
             cute.make_layout((1, 8))
         )
 
@@ -410,7 +447,9 @@ class FusedQKV:
         # Write Float32 accumulator directly to sOut_bf16 by casting to BFloat16 in registers first
         sOut_bf16 = cute.make_tensor(cute.recast_ptr(storage.sX_raw.data_ptr().align(16), dtype=BFloat16), epi_smem_layout)
         tCsOut = thr_mma.partition_C(sOut_bf16)
-        accum_bf16 = cute.make_fragment_like(tCsOut, BFloat16)
+        print("DEBUG COMPILATION: sOut_bf16 layout =", sOut_bf16.layout)
+        print("DEBUG COMPILATION: tCsOut layout =", tCsOut.layout)
+        accum_bf16 = cute.make_fragment_like(accum, BFloat16)
         
         for idx in cutlass.range(cute.size(accum), unroll_full=True):
             accum_bf16[idx] = BFloat16(accum[idx])
@@ -418,37 +457,38 @@ class FusedQKV:
         cute.copy(copy_atom_r2s_bf16, accum_bf16, tCsOut)
         cute.arch.sync_threads()
         
-        thr_copy_store = gmem_tiled_copy_store.get_slice(tidx)
-        
         if is_valid:
             if (cta_m + 1) * self.BLOCK_M <= N:
-                for h_idx in cutlass.range_constexpr(self.HEAD_GROUP):
-                    global_h = self.HEAD_GROUP * cta_h_group + h_idx
-                    if global_h < self.NUM_HEADS:
-                        head_offset = h_idx * (3 * self.HEAD_DIM)
-                        
-                        sOut_h_q = cute.make_tensor((sOut_bf16.iterator + head_offset).align(16), cute.make_layout((self.BLOCK_M, self.HEAD_DIM), stride=(self.BLOCK_N_padded, 1)))
-                        sOut_h_k = cute.make_tensor((sOut_bf16.iterator + head_offset + self.HEAD_DIM).align(16), cute.make_layout((self.BLOCK_M, self.HEAD_DIM), stride=(self.BLOCK_N_padded, 1)))
-                        sOut_h_v = cute.make_tensor((sOut_bf16.iterator + head_offset + 2 * self.HEAD_DIM).align(16), cute.make_layout((self.BLOCK_M, self.HEAD_DIM), stride=(self.BLOCK_N_padded, 1)))
-                        
-                        g_offset = cta_b * (self.NUM_HEADS * N * self.HEAD_DIM) + global_h * (N * self.HEAD_DIM) + (cta_m * self.BLOCK_M) * self.HEAD_DIM
-                        
-                        g_tile_q = cute.make_tensor((q_proj.iterator + g_offset).align(16), cute.make_layout((self.BLOCK_M, self.HEAD_DIM), stride=(self.HEAD_DIM, 1)))
-                        g_tile_k = cute.make_tensor((k_proj.iterator + g_offset).align(16), cute.make_layout((self.BLOCK_M, self.HEAD_DIM), stride=(self.HEAD_DIM, 1)))
-                        g_tile_v = cute.make_tensor((v_proj.iterator + g_offset).align(16), cute.make_layout((self.BLOCK_M, self.HEAD_DIM), stride=(self.HEAD_DIM, 1)))
-                        
-                        tS_q = thr_copy_store.partition_S(sOut_h_q)
-                        tD_q = thr_copy_store.partition_D(g_tile_q)
-                        
-                        tS_k = thr_copy_store.partition_S(sOut_h_k)
-                        tD_k = thr_copy_store.partition_D(g_tile_k)
-                        
-                        tS_v = thr_copy_store.partition_S(sOut_h_v)
-                        tD_v = thr_copy_store.partition_D(g_tile_v)
-                        
-                        cute.copy(gmem_tiled_copy_store, tS_q, tD_q)
-                        cute.copy(gmem_tiled_copy_store, tS_k, tD_k)
-                        cute.copy(gmem_tiled_copy_store, tS_v, tD_v)
+                if tidx < self.store_thr_m * self.store_thr_n:
+                    thr_copy_store = gmem_tiled_copy_store.get_slice(tidx)
+                    for h_idx in cutlass.range_constexpr(self.HEAD_GROUP):
+                        global_h = self.HEAD_GROUP * cta_h_group + h_idx
+                        if global_h < self.NUM_HEADS:
+                            sOut_h_q = cute.make_tensor((sOut_bf16.iterator + h_idx * self.HEAD_DIM).align(16), cute.make_layout((self.BLOCK_M, self.HEAD_DIM), stride=(self.BLOCK_N_padded, 1)))
+                            sOut_h_k = cute.make_tensor((sOut_bf16.iterator + self.HEAD_GROUP * self.HEAD_DIM + h_idx * self.HEAD_DIM).align(16), cute.make_layout((self.BLOCK_M, self.HEAD_DIM), stride=(self.BLOCK_N_padded, 1)))
+                            sOut_h_v = cute.make_tensor((sOut_bf16.iterator + 2 * self.HEAD_GROUP * self.HEAD_DIM + h_idx * self.HEAD_DIM).align(16), cute.make_layout((self.BLOCK_M, self.HEAD_DIM), stride=(self.BLOCK_N_padded, 1)))
+                            
+                            g_offset = cta_b * (self.NUM_HEADS * N * self.HEAD_DIM) + global_h * (N * self.HEAD_DIM) + (cta_m * self.BLOCK_M) * self.HEAD_DIM
+                            
+                            g_tile_q = cute.make_tensor((q_proj.iterator + g_offset).align(16), cute.make_layout((self.BLOCK_M, self.HEAD_DIM), stride=(self.HEAD_DIM, 1)))
+                            g_tile_k = cute.make_tensor((k_proj.iterator + g_offset).align(16), cute.make_layout((self.BLOCK_M, self.HEAD_DIM), stride=(self.HEAD_DIM, 1)))
+                            g_tile_v = cute.make_tensor((v_proj.iterator + g_offset).align(16), cute.make_layout((self.BLOCK_M, self.HEAD_DIM), stride=(self.HEAD_DIM, 1)))
+                            
+                            tS_q = thr_copy_store.partition_S(sOut_h_q)
+                            tD_q = thr_copy_store.partition_D(g_tile_q)
+                            print("DEBUG COMPILATION: sOut_h_q layout =", sOut_h_q.layout)
+                            print("DEBUG COMPILATION: tS_q layout =", tS_q.layout)
+                            print("DEBUG COMPILATION: tD_q layout =", tD_q.layout)
+                            
+                            tS_k = thr_copy_store.partition_S(sOut_h_k)
+                            tD_k = thr_copy_store.partition_D(g_tile_k)
+                            
+                            tS_v = thr_copy_store.partition_S(sOut_h_v)
+                            tD_v = thr_copy_store.partition_D(g_tile_v)
+                            
+                            cute.copy(gmem_tiled_copy_store, tS_q, tD_q)
+                            cute.copy(gmem_tiled_copy_store, tS_k, tD_k)
+                            cute.copy(gmem_tiled_copy_store, tS_v, tD_v)
             else:
                 h_local_thread = tidx // self.BLOCK_M
                 if h_local_thread < self.HEAD_GROUP:
@@ -463,10 +503,13 @@ class FusedQKV:
                             k_g = k_proj.iterator + g_offset_thread
                             v_g = v_proj.iterator + g_offset_thread
                             
-                            row_offset_thread = row * self.BLOCK_N_padded + h_local_thread * (3 * self.HEAD_DIM)
-                            q_s = sOut_bf16.iterator + row_offset_thread
-                            k_s = sOut_bf16.iterator + row_offset_thread + self.HEAD_DIM
-                            v_s = sOut_bf16.iterator + row_offset_thread + 2 * self.HEAD_DIM
+                            q_s_offset = row * self.BLOCK_N_padded + h_local_thread * self.HEAD_DIM
+                            k_s_offset = row * self.BLOCK_N_padded + self.HEAD_GROUP * self.HEAD_DIM + h_local_thread * self.HEAD_DIM
+                            v_s_offset = row * self.BLOCK_N_padded + 2 * self.HEAD_GROUP * self.HEAD_DIM + h_local_thread * self.HEAD_DIM
+                            
+                            q_s = sOut_bf16.iterator + q_s_offset
+                            k_s = sOut_bf16.iterator + k_s_offset
+                            v_s = sOut_bf16.iterator + v_s_offset
                             
                             for j in cutlass.range(self.HEAD_DIM, unroll_full=True):
                                 q_g[j] = q_s[j]
@@ -475,8 +518,10 @@ class FusedQKV:
 
 _fused_qkv_compile_cache = {}
 
-def get_fused_qkv_kernel(num_warps=4, BLOCK_M=64, BLOCK_K_STAGE=32, NUM_HEADS=16, HEAD_DIM=64, HEAD_GROUP=2, hidden=512, use_sync_in_loop=True, ab_stage=None, maxrregcount=255, swizzle_x=8):
-    key = (num_warps, BLOCK_M, BLOCK_K_STAGE, NUM_HEADS, HEAD_DIM, HEAD_GROUP, hidden, use_sync_in_loop, ab_stage, maxrregcount, swizzle_x)
+def get_fused_qkv_kernel(num_warps=4, BLOCK_M=64, BLOCK_K_STAGE=32, NUM_HEADS=16, HEAD_DIM=64, HEAD_GROUP=2, hidden=512, use_sync_in_loop=True, ab_stage=None, maxrregcount=255, swizzle_x=8, atom_layout_mnk=None):
+    if isinstance(atom_layout_mnk, list):
+        atom_layout_mnk = tuple(atom_layout_mnk)
+    key = (num_warps, BLOCK_M, BLOCK_K_STAGE, NUM_HEADS, HEAD_DIM, HEAD_GROUP, hidden, use_sync_in_loop, ab_stage, maxrregcount, swizzle_x, atom_layout_mnk)
     if key not in _fused_qkv_compile_cache:
         B_sym = cute.sym_int()
         N_sym = cute.sym_int()
@@ -491,7 +536,8 @@ def get_fused_qkv_kernel(num_warps=4, BLOCK_M=64, BLOCK_K_STAGE=32, NUM_HEADS=16
             hidden=hidden,
             use_sync_in_loop=use_sync_in_loop,
             ab_stage=ab_stage,
-            swizzle_x=swizzle_x
+            swizzle_x=swizzle_x,
+            atom_layout_mnk=atom_layout_mnk
         )
         
         x_fake = make_fake_tensor(BFloat16, (B_sym, N_sym, hidden), 16)
@@ -515,44 +561,58 @@ def get_fused_qkv_kernel(num_warps=4, BLOCK_M=64, BLOCK_K_STAGE=32, NUM_HEADS=16
         _fused_qkv_compile_cache[key] = compiled_fwd
     return _fused_qkv_compile_cache[key]
  
+_fwd_kernel_cache = {}
+
 @torch.library.custom_op("flash_prologue::fused_qkv", mutates_args=())
 def fused_qkv_op(
     x: torch.Tensor,
     weight: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    B, N, hidden = x.shape
-    num_heads = weight.shape[0] // 3 // 64
+    x = _ensure_contiguous(x)
+    weight = _ensure_contiguous(weight)
+    B = int(x.shape[0])
+    N = int(x.shape[1])
+    hidden = int(x.shape[2])
+    num_heads = int(weight.shape[0] // 3 // 64)
     head_dim = 64
     
-    # Query Autotuner for optimal shape configs
-    from flash_attn_prologue.autotune import get_autotuned_config
-    config = get_autotuned_config(B * N, 3 * num_heads * head_dim, hidden, "fused_qkv", device=str(x.device))
-    
-    block_m = config["BLOCK_M"]
-    block_k = config["BLOCK_K"]
-    head_group = config.get("HEAD_GROUP", 2)
-    ab_stage = config.get("ab_stage", None)
-    num_warps = config.get("num_warps", 4)
-    maxrregcount = config.get("maxrregcount", 255)
-    swizzle_x = config.get("swizzle_x", 8)
-    
+    if x.numel() == 0 or weight.numel() == 0:
+        q_proj_bf16 = torch.zeros((B, num_heads, N, head_dim), dtype=torch.bfloat16, device=x.device)
+        k_proj_bf16 = torch.zeros((B, num_heads, N, head_dim), dtype=torch.bfloat16, device=x.device)
+        v_proj_bf16 = torch.zeros((B, num_heads, N, head_dim), dtype=torch.bfloat16, device=x.device)
+        return q_proj_bf16, k_proj_bf16, v_proj_bf16
+        
+    shape_key = (B, N)
+    fwd_kernel = _fwd_kernel_cache.get(shape_key)
+    if fwd_kernel is None:
+        config = get_autotuned_config(B * N, 3 * num_heads * head_dim, hidden, "fused_qkv", device=str(x.device))
+        block_m = config["BLOCK_M"]
+        block_k = config["BLOCK_K"]
+        head_group = config.get("HEAD_GROUP", 2)
+        ab_stage = config.get("ab_stage", None)
+        num_warps = config.get("num_warps", 4)
+        maxrregcount = config.get("maxrregcount", 255)
+        swizzle_x = config.get("swizzle_x", 8)
+        
+        fwd_kernel = get_fused_qkv_kernel(
+            num_warps=num_warps,
+            BLOCK_M=block_m,
+            BLOCK_K_STAGE=block_k,
+            NUM_HEADS=num_heads,
+            HEAD_DIM=head_dim,
+            HEAD_GROUP=head_group,
+            hidden=hidden,
+            use_sync_in_loop=True,
+            ab_stage=ab_stage,
+            maxrregcount=maxrregcount,
+            swizzle_x=swizzle_x,
+            atom_layout_mnk=config.get("atom_layout_mnk", None)
+        )
+        _fwd_kernel_cache[shape_key] = fwd_kernel
+        
     q_proj_bf16 = torch.empty((B, num_heads, N, head_dim), dtype=torch.bfloat16, device=x.device)
     k_proj_bf16 = torch.empty((B, num_heads, N, head_dim), dtype=torch.bfloat16, device=x.device)
     v_proj_bf16 = torch.empty((B, num_heads, N, head_dim), dtype=torch.bfloat16, device=x.device)
-    
-    fwd_kernel = get_fused_qkv_kernel(
-        num_warps=num_warps,
-        BLOCK_M=block_m,
-        BLOCK_K_STAGE=block_k,
-        NUM_HEADS=num_heads,
-        HEAD_DIM=head_dim,
-        HEAD_GROUP=head_group,
-        hidden=hidden,
-        use_sync_in_loop=True,
-        ab_stage=ab_stage,
-        maxrregcount=maxrregcount,
-        swizzle_x=swizzle_x
-    )
     
     num_heads_x_dim = num_heads * head_dim
     weight_q = weight[0 : num_heads_x_dim, :]
@@ -571,6 +631,11 @@ def _fused_qkv_fake(x, weight):
     B, N, hidden = x.shape
     num_heads = weight.shape[0] // 3 // 64
     head_dim = 64
+    if x.numel() == 0 or weight.numel() == 0:
+        q_proj = torch.zeros((B, num_heads, N, head_dim), dtype=x.dtype, device=x.device)
+        k_proj = torch.zeros((B, num_heads, N, head_dim), dtype=x.dtype, device=x.device)
+        v_proj = torch.zeros((B, num_heads, N, head_dim), dtype=x.dtype, device=x.device)
+        return q_proj, k_proj, v_proj
     q_proj = torch.empty((B, num_heads, N, head_dim), dtype=x.dtype, device=x.device)
     k_proj = torch.empty((B, num_heads, N, head_dim), dtype=x.dtype, device=x.device)
     v_proj = torch.empty((B, num_heads, N, head_dim), dtype=x.dtype, device=x.device)
@@ -581,28 +646,12 @@ def _fused_qkv_setup_context(ctx, inputs, output):
     q_proj, k_proj, v_proj = output
     ctx.save_for_backward(x, weight)
 
-_BACKWARD_DX_STREAM = None
-
 def _fused_qkv_backward(ctx, grad_q_proj, grad_k_proj, grad_v_proj):
     x, weight = ctx.saved_tensors
-    B, N, hidden = x.shape
     
-    from flash_attn_prologue.gemm_bwd import matmul_bwd_dx, matmul_bwd_dw
-    
-    # Run matmul_bwd_dx and matmul_bwd_dw concurrently on separate CUDA streams
-    global _BACKWARD_DX_STREAM
-    if _BACKWARD_DX_STREAM is None:
-        _BACKWARD_DX_STREAM = torch.cuda.Stream(device=grad_q_proj.device)
-        
-    with torch.cuda.stream(_BACKWARD_DX_STREAM):
-        grad_x_flat = matmul_bwd_dx(grad_q_proj, grad_k_proj, grad_v_proj, weight)
-        
-    grad_weight = matmul_bwd_dw(grad_q_proj, grad_k_proj, grad_v_proj, x)
-    
-    # Synchronize default stream with _BACKWARD_DX_STREAM
-    torch.cuda.current_stream().wait_stream(_BACKWARD_DX_STREAM)
-    
-    grad_x = grad_x_flat.reshape(B, N, hidden)
+    grad_x, grad_weight = torch.ops.flash_prologue.fused_qkv_backward(
+        grad_q_proj, grad_k_proj, grad_v_proj, weight, x
+    )
     return grad_x, grad_weight
 
 torch.library.register_autograd(

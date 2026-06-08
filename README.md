@@ -69,3 +69,8 @@ Verify the cloned and adapted TMA-based backward GEMM kernels (`matmul_bwd_dx` a
 ```bash
 PYTHONPATH=. CUTE_DSL_LIBS=/home/achiya/vs_code_main/flash_attn_prologue/.venv/lib/python3.13/site-packages/nvidia_cutlass_dsl/lib/libcute_dsl_runtime.so .venv/bin/pytest tests/test_gemm_bwd_clone.py
 ```
+
+Verify and benchmark the fully integrated Fused QKV Forward + Fused TMA-based Backward pass:
+```bash
+PYTHONPATH=. CUTE_DSL_LIBS=/home/achiya/vs_code_main/flash_attn_prologue/.venv/lib/python3.13/site-packages/nvidia_cutlass_dsl/lib/libcute_dsl_runtime.so .venv/bin/pytest -s tests/test_fused_qkv_bwd.py
+```

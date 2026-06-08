@@ -29,16 +29,21 @@ def test_cloned_gemm_bwd():
     weight = truncated_normal((3 * num_heads * head_dim, hidden), std=0.3)
     x = truncated_normal((B * N, hidden), std=0.3)
     
+    grad_qkv = grad_output.view(B, N, 3, num_heads, head_dim)
+    grad_q = grad_qkv[..., 0, :, :].permute(0, 2, 1, 3).contiguous()
+    grad_k = grad_qkv[..., 1, :, :].permute(0, 2, 1, 3).contiguous()
+    grad_v = grad_qkv[..., 2, :, :].permute(0, 2, 1, 3).contiguous()
+    
     # 2. Reference eager outputs
     grad_x_eager = grad_output @ weight
     grad_weight_eager = grad_output.t() @ x
     
     # 3. Cloned CuTe JIT custom operator outputs
     print("Compiling and running raw CuTe matmul_bwd_dx...")
-    grad_x_cute = torch.ops.flash_prologue.matmul_bwd_dx_cute(grad_output, weight)
+    grad_x_cute = torch.ops.flash_prologue.matmul_bwd_dx_cute(grad_q, grad_k, grad_v, weight)
     
     print("Compiling and running raw CuTe matmul_bwd_dw...")
-    grad_weight_cute = torch.ops.flash_prologue.matmul_bwd_dw_cute(grad_output.t(), x)
+    grad_weight_cute = torch.ops.flash_prologue.matmul_bwd_dw_cute(grad_q, grad_k, grad_v, x)
     
     # 4. Correctness Assertions
     diff_dx = (grad_x_cute - grad_x_eager).abs().max().item()
@@ -95,7 +100,7 @@ def test_cloned_gemm_bwd():
     # CuTe dx
     start = time.perf_counter()
     for _ in range(100):
-        _ = torch.ops.flash_prologue.matmul_bwd_dx_cute(grad_output, weight)
+        _ = torch.ops.flash_prologue.matmul_bwd_dx_cute(grad_q, grad_k, grad_v, weight)
     torch.cuda.synchronize()
     cute_dx_time = (time.perf_counter() - start) * 1000 / 100
     
@@ -109,7 +114,7 @@ def test_cloned_gemm_bwd():
     # CuTe dw
     start = time.perf_counter()
     for _ in range(100):
-        _ = torch.ops.flash_prologue.matmul_bwd_dw_cute(grad_output.t(), x)
+        _ = torch.ops.flash_prologue.matmul_bwd_dw_cute(grad_q, grad_k, grad_v, x)
     torch.cuda.synchronize()
     cute_dw_time = (time.perf_counter() - start) * 1000 / 100
     

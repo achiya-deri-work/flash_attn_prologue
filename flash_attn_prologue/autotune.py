@@ -24,218 +24,258 @@ def save_cache(cache: Dict[str, Any]):
     except Exception:
         pass
 
+def get_valid_warp_layouts(warps):
+    layouts = []
+    # Find all factorizations of warps = m * n (with k=1 to avoid runtime illegal memory access)
+    for m in range(1, warps + 1):
+        if warps % m != 0:
+            continue
+        n = warps // m
+        layouts.append((m, n, 1))
+    return layouts
+
+
+def is_config_valid(config: Dict[str, Any], mode: str) -> bool:
+    # 1. Base warp layouts extraction
+    num_warps = config.get("num_warps", 4)
+    num_threads = num_warps * 32
+    
+    # 2. Extract layouts
+    w_layout = config.get("atom_layout_mnk", None)
+    if w_layout is not None:
+        if isinstance(w_layout, list):
+            w_layout = tuple(w_layout)
+        m, n, k = w_layout
+    else:
+        bm = config.get("BLOCK_M", 64)
+        if mode == "fused_qkv" and bm == 16:
+            if num_warps == 4:
+                m, n, k = 1, 4, 1
+            elif num_warps == 2:
+                m, n, k = 1, 2, 1
+            elif num_warps == 6:
+                m, n, k = 1, 6, 1
+            elif num_warps == 8:
+                m, n, k = 1, 8, 1
+            else:
+                m, n, k = 1, num_warps, 1
+        else:
+            if num_warps == 4:
+                m, n, k = 2, 2, 1
+            elif num_warps == 2:
+                m, n, k = 2, 1, 1
+            elif num_warps == 6:
+                m, n, k = 3, 2, 1
+            elif num_warps == 8:
+                m, n, k = 4, 2, 1
+            elif num_warps == 12:
+                m, n, k = 4, 3, 1
+            elif num_warps == 16:
+                m, n, k = 4, 4, 1
+            else:
+                m, n, k = num_warps, 1, 1
+            
+    # 3. K-dimension layouts matching constraints (k=1)
+    if k > 1:
+        return False
+        
+    # 4. Divisibility check for warp layout sizes
+    # BLOCK_M (or 3 * BLOCK_M) must be a multiple of m * 16 (MMA shape M)
+    bm = config.get("BLOCK_M", 64)
+    val_m = 3 * bm if mode == "bwd_dw" else bm
+    if val_m % (m * 16) != 0:
+        return False
+        
+    # BLOCK_N must be a multiple of n * 8 (MMA shape N)
+    if mode in ("bwd_dx", "bwd_dw", "fused_qkv", "fused"):
+        if mode in ("fused_qkv", "fused"):
+            bn = config.get("BLOCK_N", config.get("HEAD_GROUP", 2) * 3 * 64)
+        else:
+            bn = config.get("BLOCK_N", 64)
+        if bn % (n * 8) != 0:
+            return False
+            
+    # 5. Global store boundary constraints for tiled copy (for bwd_dx)
+    if mode == "bwd_dx":
+        bn = config.get("BLOCK_N", 64)
+        store_thr_m = min(16, bm)
+        store_thr_n = num_threads // store_thr_m
+        if store_thr_n * 8 > bn:
+            return False
+        # K-Dimension Layout Matching: if n > 1, BLOCK_K must be 16
+        bk = config.get("BLOCK_K", 16)
+        if n > 1 and bk != 16:
+            return False
+            
+    # 6. Thread occupancy constraints for bwd_dw
+    if mode == "bwd_dw":
+        bn = config.get("BLOCK_N", 64)
+        threads_col = min(bn, num_threads)
+        if num_threads % threads_col != 0 or bn % threads_col != 0:
+            return False
+        threads_row = num_threads // threads_col
+        if val_m % threads_row != 0:
+            return False
+            
+    # 7. Additional constraints for epilogue mode
+    if mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
+        hg = config.get("HEAD_GROUP", 1)
+        stage = config.get("ab_stage", 1)
+        if mode == "epilogue_bwd":
+            required_threads = bm * hg
+        elif mode == "epilogue_fwd":
+            required_threads = (bm // stage) * hg
+        else:
+            required_threads = max((bm // stage) * hg, bm * hg)
+        if num_threads < required_threads:
+            return False
+            
+    # 8. Thread occupancy constraints for fused_qkv
+    if mode in ("fused_qkv", "fused"):
+        bm = config.get("BLOCK_M", 64)
+        hg = config.get("HEAD_GROUP", 1)
+        if num_threads < bm * hg:
+            return False
+            
+    return True
+
+
+def get_b_n_seq(total_elements):
+    # Find N_seq as the largest divisor of total_elements in [512, 256, 128, 64, 32, 16]
+    for n_seq in [512, 256, 128, 64, 32, 16]:
+        if total_elements % n_seq == 0:
+            return total_elements // n_seq, n_seq
+    # Fallback
+    return 1, total_elements
+
 def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[str, int]:
     if isinstance(is_fused, bool):
         mode = "fused" if is_fused else "gemm"
     else:
         mode = is_fused
 
-    if mode == "fused":
-        candidates = [
-            {"HEAD_GROUP": 1, "BLOCK_M": 64, "BLOCK_N": 192, "BLOCK_K": 32},
-            {"HEAD_GROUP": 1, "BLOCK_M": 64, "BLOCK_N": 192, "BLOCK_K": 16},
-            {"HEAD_GROUP": 1, "BLOCK_M": 32, "BLOCK_N": 192, "BLOCK_K": 32},
-            {"HEAD_GROUP": 1, "BLOCK_M": 32, "BLOCK_N": 192, "BLOCK_K": 16},
-            {"HEAD_GROUP": 2, "BLOCK_M": 64, "BLOCK_N": 384, "BLOCK_K": 32},
-            {"HEAD_GROUP": 2, "BLOCK_M": 64, "BLOCK_N": 384, "BLOCK_K": 16},
-            {"HEAD_GROUP": 2, "BLOCK_M": 32, "BLOCK_N": 384, "BLOCK_K": 32},
-            {"HEAD_GROUP": 2, "BLOCK_M": 32, "BLOCK_N": 384, "BLOCK_K": 16},
-            {"HEAD_GROUP": 4, "BLOCK_M": 32, "BLOCK_N": 768, "BLOCK_K": 16},
-            {"HEAD_GROUP": 4, "BLOCK_M": 16, "BLOCK_N": 768, "BLOCK_K": 32},
-            {"HEAD_GROUP": 4, "BLOCK_M": 16, "BLOCK_N": 768, "BLOCK_K": 16},
-            {"HEAD_GROUP": 8, "BLOCK_M": 16, "BLOCK_N": 1536, "BLOCK_K": 16},
-            {"HEAD_GROUP": 8, "BLOCK_M": 16, "BLOCK_N": 1536, "BLOCK_K": 8},
-        ]
-    elif mode == "fused_qkv":
-        candidates = []
-        for hg in [1, 2]:
-            for bm in [32, 64]:
-                for bk in [16, 32]:
-                    for stage in [2, 3]:
-                        for warps in [4, 8]:
-                            for regs in [128, 255]:
-                                for swizzle in [1, 2, 4, 8, 16]:
-                                    # Calculate SMEM bytes
-                                    block_n = hg * 3 * 64
-                                    mainloop_bytes = (stage * bm * bk * 2) + (stage * block_n * bk * 2)
-                                    epilogue_bytes = bm * (block_n + 8) * 4
-                                    smem_bytes = max(mainloop_bytes, epilogue_bytes)
-                                    if smem_bytes <= 99 * 1024:
-                                        candidates.append({
-                                            "HEAD_GROUP": hg,
-                                            "BLOCK_M": bm,
-                                            "BLOCK_K": bk,
-                                            "ab_stage": stage,
-                                            "num_warps": warps,
-                                            "maxrregcount": regs,
-                                            "swizzle_x": swizzle
-                                        })
-    elif mode in ("bwd_dx", "bwd_dw"):
-        candidates = []
-        if mode == "bwd_dx":
-            # dx requires 128x128 and ab_stage = 3 to avoid Write-After-Read race conditions / NaNs
-            for swizzle in [1, 2, 4, 8, 16]:
-                candidates.append({
-                    "BLOCK_M": 128,
-                    "BLOCK_N": 128,
-                    "BLOCK_K": 32,
-                    "ab_stage": 3,
-                    "num_warps": 4,
-                    "maxrregcount": 255,
-                    "swizzle_x": swizzle
-                })
-        else: # bwd_dw
-            # Support BLOCK_M = 64 (for TMA head dimension contiguity) with BLOCK_N in [64, 128, 256] and ab_stage in [2, 3, 4]
-            for bm in [64]:
-                for bn in [64, 128, 256]:
-                    for bk in [32]:
-                        for stage in [2, 3, 4]:
-                            for regs in [255]:
-                                for split_k in [1, 2, 4, 8, 16, 32]:
-                                    for swizzle in [1, 2, 4, 8, 16]:
-                                        # Calculate SMEM bytes
-                                        sX_bytes = stage * bm * bk * 2
-                                        sW_bytes = stage * bn * bk * 2
-                                        mainloop_bytes = sX_bytes + sW_bytes
-                                        epilogue_bytes = bm * (bn + 8) * 4
-                                        smem_bytes = max(mainloop_bytes, epilogue_bytes)
-                                        if smem_bytes <= 99 * 1024:
-                                            candidates.append({
-                                                "BLOCK_M": bm,
-                                                "BLOCK_N": bn,
-                                                "BLOCK_K": bk,
-                                                "ab_stage": stage,
-                                                "num_warps": 4,
-                                                "maxrregcount": regs,
-                                                "SPLIT_K": split_k,
-                                                "swizzle_x": swizzle
-                                            })
-    elif mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
-        candidates = []
-        for hg in [1, 2, 4, 8]:
-            if mode in ("epilogue", "epilogue_fwd") and hg > 2:
-                continue
-            if N % hg != 0: # N is NUM_HEADS
-                continue
-            for bm in [16, 32, 64, 128, 256]:
-                for warps in [2, 4, 8]:
-                    for regs in [128, 255]:
-                        # Sweep ab_stage in [1, 2] for fwd/combined, 1 for bwd
-                        stages = [1, 2] if mode in ("epilogue", "epilogue_fwd") else [1]
-                        for stage in stages:
-                            if bm % stage != 0:
-                                continue
-                            # Ensure the thread count is sufficient to cover the block shape
-                            # Forward requires self.SUB_M * self.HEAD_GROUP threads (where SUB_M = bm // stage)
-                            # Backward requires self.BLOCK_M * self.HEAD_GROUP threads
-                            num_threads = warps * 32
-                            if mode == "epilogue_bwd":
-                                required_threads = bm * hg
-                            elif mode == "epilogue_fwd":
-                                required_threads = (bm // stage) * hg
-                            else: # mode == "epilogue"
-                                required_threads = max((bm // stage) * hg, bm * hg)
-                                
-                            if num_threads < required_threads:
-                                continue
-                                
-                            # Calculate SMEM bytes depending on the mode
-                            if mode == "epilogue_bwd":
-                                # Backward SMEM calculation
-                                s_rmsnorm_reduction_elems = bm * 2 * hg * K
-                                s_scales_offset = ((s_rmsnorm_reduction_elems + 31) // 32) * 32
-                                total_elems = s_scales_offset + bm * hg
-                                flat_smem_elements = ((total_elems + 31) // 32) * 32
-                                smem_bytes = flat_smem_elements * 4
-                            else:
-                                # Forward (or combined) SMEM calculation
-                                block_n = hg * K
-                                block_n_padded = block_n + 8
-                                smem_bytes = 2 * (bm * block_n_padded * 2)
-                                if mode == "epilogue": # needs both to fit
-                                    s_rmsnorm_reduction_elems = bm * 2 * hg * K
-                                    s_scales_offset = ((s_rmsnorm_reduction_elems + 31) // 32) * 32
-                                    total_elems = s_scales_offset + bm * hg
-                                    flat_smem_elements = ((total_elems + 31) // 32) * 32
-                                    bwd_smem_bytes = flat_smem_elements * 4
-                                    smem_bytes = max(smem_bytes, bwd_smem_bytes)
-                                    
-                            if smem_bytes <= 99 * 1024:
-                                candidates.append({
-                                    "HEAD_GROUP": hg,
-                                    "BLOCK_M": bm,
-                                    "BLOCK_K": K,
-                                    "ab_stage": stage,
-                                    "num_warps": warps,
-                                    "maxrregcount": regs
-                                })
-    else:
-        # Candidates: (BLOCK_M, BLOCK_N, BLOCK_K)
-        candidates_raw = [
-            (128, 128, 64),
-            (128, 64, 128),
-            (64, 128, 128),
-            (64, 64, 128),
-            (128, 64, 64),
-            (64, 128, 64),
-            (64, 64, 64),
-            (128, 128, 32),
-            (128, 64, 32),
-            (64, 128, 32),
-            (64, 64, 32),
-        ]
-        candidates = []
-        for bm, bn, bk in candidates_raw:
-            # Check active SMEM footprint for 2-stage double-buffered pipeline
-            smem_bytes = (bm * bk * 2 * 2) + (bn * bk * 2 * 2)
-            if smem_bytes <= 99 * 1024:  # Blackwell sm_120a SMEM limit (99 KB)
-                candidates.append({"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk})
-            
-    if not candidates:
-        if mode == "fused_qkv":
-            return {"HEAD_GROUP": 1, "BLOCK_M": 64, "BLOCK_K": 16, "ab_stage": 3, "num_warps": 4, "maxrregcount": 255}
-        elif mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
-            return {"HEAD_GROUP": 2, "BLOCK_M": 64, "ab_stage": 1, "num_warps": 4, "maxrregcount": 255}
-        elif mode == "fused":
-            return {"HEAD_GROUP": 2, "BLOCK_M": 64, "BLOCK_N": 384, "BLOCK_K": 32}
-        elif mode == "bwd_dx":
-            return {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "ab_stage": 3, "num_warps": 4, "maxrregcount": 255}
-        elif mode == "bwd_dw":
-            return {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "ab_stage": 3, "num_warps": 4, "maxrregcount": 255}
-        else:
-            return {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}
-        
-    best_config = None
-    best_time = float("inf")
-    
-    prof_M = min(M, 16384)  # Clamp sequence length to keep compilation/profiling latency small
+    prof_M = min(M, 16384)
     prof_N = N
     prof_K = K
+
+    # Setup reference data and outputs for correctness validation
+    ref_data = {}
+    from cutlass import BFloat16, Float32
+    from quack.compile_utils import make_fake_tensor
     
-    for config in candidates:
+    if mode == "fused_qkv":
+        num_heads = N // 3 // 64
+        head_dim = 64
+        hidden = K
+        B_prof, seq_prof = get_b_n_seq(prof_M)
+        
+        x_prof = torch.randn(B_prof, seq_prof, hidden, device=device, dtype=torch.bfloat16) * 0.1
+        weight_prof = torch.randn(3 * num_heads * head_dim, hidden, device=device, dtype=torch.bfloat16) * 0.1
+        
+        num_heads_x_dim = num_heads * head_dim
+        weight_q_prof = weight_prof[0 : num_heads_x_dim, :].clone()
+        weight_k_prof = weight_prof[num_heads_x_dim : 2 * num_heads_x_dim, :].clone()
+        weight_v_prof = weight_prof[2 * num_heads_x_dim : 3 * num_heads_x_dim, :].clone()
+        
+        q_ref = (x_prof.view(-1, hidden) @ weight_q_prof.t()).view(B_prof, seq_prof, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
+        k_ref = (x_prof.view(-1, hidden) @ weight_k_prof.t()).view(B_prof, seq_prof, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
+        v_ref = (x_prof.view(-1, hidden) @ weight_v_prof.t()).view(B_prof, seq_prof, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
+        
+        ref_data = {
+            "x_prof": x_prof, "weight_prof": weight_prof,
+            "weight_q_prof": weight_q_prof, "weight_k_prof": weight_k_prof, "weight_v_prof": weight_v_prof,
+            "q_ref": q_ref, "k_ref": k_ref, "v_ref": v_ref,
+            "num_heads": num_heads, "head_dim": head_dim, "hidden": hidden,
+            "B_prof": B_prof, "seq_prof": seq_prof
+        }
+    elif mode == "bwd_dx":
+        B_prof, N_seq_prof = get_b_n_seq(prof_M)
+        num_heads = prof_K // 3 // 64
+        head_dim = 64
+        grad_q_prof = torch.randn(B_prof, num_heads, N_seq_prof, head_dim, device=device, dtype=torch.bfloat16) * 0.1
+        grad_k_prof = torch.randn(B_prof, num_heads, N_seq_prof, head_dim, device=device, dtype=torch.bfloat16) * 0.1
+        grad_v_prof = torch.randn(B_prof, num_heads, N_seq_prof, head_dim, device=device, dtype=torch.bfloat16) * 0.1
+        weight_prof = torch.randn(prof_K, prof_N, device=device, dtype=torch.bfloat16) * 0.1
+        
+        grad_qkv = torch.empty((B_prof * N_seq_prof, 3 * num_heads * head_dim), device=device, dtype=torch.bfloat16)
+        grad_q_flat = grad_q_prof.permute(0, 2, 1, 3).reshape(B_prof * N_seq_prof, num_heads * head_dim)
+        grad_k_flat = grad_k_prof.permute(0, 2, 1, 3).reshape(B_prof * N_seq_prof, num_heads * head_dim)
+        grad_v_flat = grad_v_prof.permute(0, 2, 1, 3).reshape(B_prof * N_seq_prof, num_heads * head_dim)
+        grad_qkv[:, 0 : num_heads * head_dim] = grad_q_flat
+        grad_qkv[:, num_heads * head_dim : 2 * num_heads * head_dim] = grad_k_flat
+        grad_qkv[:, 2 * num_heads * head_dim : 3 * num_heads * head_dim] = grad_v_flat
+        
+        ref_grad_x = grad_qkv @ weight_prof
+        
+        ref_data = {
+            "grad_q_prof": grad_q_prof, "grad_k_prof": grad_k_prof, "grad_v_prof": grad_v_prof,
+            "weight_prof": weight_prof, "ref_grad_x": ref_grad_x,
+            "B_prof": B_prof, "N_seq_prof": N_seq_prof,
+            "num_heads": num_heads
+        }
+    elif mode == "bwd_dw":
+        B_prof, N_seq_prof = get_b_n_seq(prof_K)
+        num_heads = prof_M // 3 // 64
+        head_dim = 64
+        grad_q_prof = torch.randn(B_prof, num_heads, N_seq_prof, head_dim, device=device, dtype=torch.bfloat16) * 0.1
+        grad_k_prof = torch.randn(B_prof, num_heads, N_seq_prof, head_dim, device=device, dtype=torch.bfloat16) * 0.1
+        grad_v_prof = torch.randn(B_prof, num_heads, N_seq_prof, head_dim, device=device, dtype=torch.bfloat16) * 0.1
+        x_prof = torch.randn(prof_K, prof_N, device=device, dtype=torch.bfloat16) * 0.1
+        
+        grad_qkv = torch.empty((B_prof * N_seq_prof, 3 * num_heads * head_dim), device=device, dtype=torch.bfloat16)
+        grad_q_flat = grad_q_prof.permute(0, 2, 1, 3).reshape(B_prof * N_seq_prof, num_heads * head_dim)
+        grad_k_flat = grad_k_prof.permute(0, 2, 1, 3).reshape(B_prof * N_seq_prof, num_heads * head_dim)
+        grad_v_flat = grad_v_prof.permute(0, 2, 1, 3).reshape(B_prof * N_seq_prof, num_heads * head_dim)
+        grad_qkv[:, 0 : num_heads * head_dim] = grad_q_flat
+        grad_qkv[:, num_heads * head_dim : 2 * num_heads * head_dim] = grad_k_flat
+        grad_qkv[:, 2 * num_heads * head_dim : 3 * num_heads * head_dim] = grad_v_flat
+        
+        ref_grad_weight = grad_qkv.t() @ x_prof
+        
+        ref_data = {
+            "grad_q_prof": grad_q_prof, "grad_k_prof": grad_k_prof, "grad_v_prof": grad_v_prof,
+            "x_prof": x_prof, "ref_grad_weight": ref_grad_weight,
+            "B_prof": B_prof, "N_seq_prof": N_seq_prof,
+            "num_heads": num_heads
+        }
+
+    # Inner profile helper with build & runtime try-catches and correctness validation
+    def profile_and_verify(config):
         bm = config["BLOCK_M"]
         if bm > M:
-            continue
+            return float("inf")
         bn = config.get("BLOCK_N", config.get("HEAD_GROUP", 1) * 3 * 64)
         if mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
             if config.get("HEAD_GROUP", 1) > N:
-                continue
+                return float("inf")
         else:
             if bn > N:
-                continue
-        bk = config["BLOCK_K"]
+                return float("inf")
         
+        # Check divisibility of dimensions
+        if mode == "fused":
+            if prof_M % bm != 0:
+                return float("inf")
+        elif mode == "fused_qkv":
+            if prof_M % bm != 0:
+                return float("inf")
+        elif mode == "bwd_dx":
+            if prof_M % bm != 0 or prof_N % bn != 0:
+                return float("inf")
+        elif mode == "bwd_dw":
+            if (prof_M // 3) % bm != 0 or prof_N % bn != 0:
+                return float("inf")
+        elif mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
+            if prof_M % bm != 0:
+                return float("inf")
+                
         try:
             if mode == "fused":
                 from archive.flash_attn_prologue.fused_pipelined_kernel import get_fused_pipelined_fwd_kernel
-                
                 hg = config["HEAD_GROUP"]
-                
-                # Check if candidate matches shape dimension divisibility
                 if prof_M % bm != 0:
-                    continue
+                    return float("inf")
                 
-                # Generate contiguous weight test matrix with correct permuted shape
                 num_heads = 16
                 head_dim = 64
                 hidden = K
@@ -243,7 +283,7 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                 fwd_kernel = get_fused_pipelined_fwd_kernel(
                     num_warps=4,
                     BLOCK_M=bm,
-                    BLOCK_K_STAGE=bk,
+                    BLOCK_K_STAGE=config["BLOCK_K"],
                     NUM_HEADS=num_heads,
                     HEAD_DIM=head_dim,
                     HEAD_GROUP=hg,
@@ -253,8 +293,6 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                 B_prof = 2
                 seq_prof = prof_M // 2
                 x_prof = torch.randn(B_prof, seq_prof, hidden, device=device, dtype=torch.bfloat16)
-                
-                # Weight pre-permutation matching the specific HEAD_GROUP
                 weight_raw = torch.randn(3 * num_heads * head_dim, hidden, device=device, dtype=torch.bfloat16)
                 w_reshaped = weight_raw.view(3, num_heads, head_dim, hidden)
                 w_split = w_reshaped.view(3, num_heads // hg, hg, head_dim, hidden)
@@ -270,7 +308,6 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                 k_out = torch.empty(B_prof, num_heads, seq_prof, head_dim, device=device, dtype=torch.bfloat16)
                 v_out = torch.empty(B_prof, num_heads, seq_prof, head_dim, device=device, dtype=torch.bfloat16)
                 
-                # Warmup
                 for _ in range(3):
                     fwd_kernel(x_prof, weight_prof, rmsnorm_weight_prof, scales_prof, sin_prof, cos_prof, q_out, k_out, v_out)
                 torch.cuda.synchronize()
@@ -282,64 +319,137 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                     fwd_kernel(x_prof, weight_prof, rmsnorm_weight_prof, scales_prof, sin_prof, cos_prof, q_out, k_out, v_out)
                 end_event.record()
                 torch.cuda.synchronize()
-                curr_ms = start_event.elapsed_time(end_event) / 15.0
+                return start_event.elapsed_time(end_event) / 15.0
+
             elif mode == "fused_qkv":
                 from flash_attn_prologue.fused_qkv import get_fused_qkv_kernel
-                
-                hg = config["HEAD_GROUP"]
-                stage = config["ab_stage"]
-                warps = config["num_warps"]
-                regs = config["maxrregcount"]
-                
-                # Check if candidate matches shape dimension divisibility
-                if prof_M % bm != 0:
-                    continue
-                
-                num_heads = 16
-                head_dim = 64
-                hidden = K
-                
                 fwd_kernel = get_fused_qkv_kernel(
-                    num_warps=warps,
-                    BLOCK_M=bm,
-                    BLOCK_K_STAGE=bk,
-                    NUM_HEADS=num_heads,
-                    HEAD_DIM=head_dim,
-                    HEAD_GROUP=hg,
-                    hidden=hidden,
+                    num_warps=config["num_warps"],
+                    BLOCK_M=config["BLOCK_M"],
+                    BLOCK_K_STAGE=config["BLOCK_K"],
+                    NUM_HEADS=ref_data["num_heads"],
+                    HEAD_DIM=ref_data["head_dim"],
+                    HEAD_GROUP=config["HEAD_GROUP"],
+                    hidden=ref_data["hidden"],
                     use_sync_in_loop=True,
-                    ab_stage=stage,
-                    maxrregcount=regs,
-                    swizzle_x=config.get("swizzle_x", 8)
+                    ab_stage=config["ab_stage"],
+                    maxrregcount=config["maxrregcount"],
+                    swizzle_x=config.get("swizzle_x", 8),
+                    atom_layout_mnk=config.get("atom_layout_mnk", None)
                 )
+                q_out = torch.empty_like(ref_data["q_ref"])
+                k_out = torch.empty_like(ref_data["k_ref"])
+                v_out = torch.empty_like(ref_data["v_ref"])
                 
-                B_prof = 2
-                seq_prof = prof_M // 2
-                x_prof = torch.randn(B_prof, seq_prof, hidden, device=device, dtype=torch.bfloat16)
-                weight_prof = torch.randn(3 * num_heads * head_dim, hidden, device=device, dtype=torch.bfloat16)
+                # Warmup and correctness check
+                fwd_kernel(ref_data["x_prof"], ref_data["weight_q_prof"], ref_data["weight_k_prof"], ref_data["weight_v_prof"], q_out, k_out, v_out)
                 
-                num_heads_x_dim = num_heads * head_dim
-                weight_q_prof = weight_prof[0 : num_heads_x_dim, :]
-                weight_k_prof = weight_prof[num_heads_x_dim : 2 * num_heads_x_dim, :]
-                weight_v_prof = weight_prof[2 * num_heads_x_dim : 3 * num_heads_x_dim, :]
+                diff_q = (q_out - ref_data["q_ref"]).abs().max().item()
+                diff_k = (k_out - ref_data["k_ref"]).abs().max().item()
+                diff_v = (v_out - ref_data["v_ref"]).abs().max().item()
+                if diff_q > 0.1 or diff_k > 0.1 or diff_v > 0.1 or torch.isnan(q_out).any() or torch.isinf(q_out).any():
+                    print(f"[Autotune] fused_qkv config failed correctness check: diff_q={diff_q}, diff_k={diff_k}, diff_v={diff_v}")
+                    return float("inf")
                 
-                q_out = torch.empty(B_prof, num_heads, seq_prof, head_dim, device=device, dtype=torch.bfloat16)
-                k_out = torch.empty(B_prof, num_heads, seq_prof, head_dim, device=device, dtype=torch.bfloat16)
-                v_out = torch.empty(B_prof, num_heads, seq_prof, head_dim, device=device, dtype=torch.bfloat16)
-                
-                # Warmup
-                for _ in range(3):
-                    fwd_kernel(x_prof, weight_q_prof, weight_k_prof, weight_v_prof, q_out, k_out, v_out)
                 torch.cuda.synchronize()
-                
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
                 start_event.record()
                 for _ in range(15):
-                    fwd_kernel(x_prof, weight_q_prof, weight_k_prof, weight_v_prof, q_out, k_out, v_out)
+                    fwd_kernel(ref_data["x_prof"], ref_data["weight_q_prof"], ref_data["weight_k_prof"], ref_data["weight_v_prof"], q_out, k_out, v_out)
                 end_event.record()
                 torch.cuda.synchronize()
-                curr_ms = start_event.elapsed_time(end_event) / 15.0
+                return start_event.elapsed_time(end_event) / 15.0
+                
+            elif mode == "bwd_dx":
+                from flash_attn_prologue.gemm_bwd import get_matmul_bwd_dx_kernel
+                dx_kernel = get_matmul_bwd_dx_kernel(
+                    num_warps=config["num_warps"],
+                    BLOCK_M=config["BLOCK_M"],
+                    BLOCK_N=config["BLOCK_N"],
+                    BLOCK_K_STAGE=config["BLOCK_K"],
+                    ab_stage=config["ab_stage"],
+                    B=ref_data["B_prof"],
+                    N=ref_data["N_seq_prof"],
+                    K_dim=prof_K,
+                    N_dim=prof_N,
+                    NUM_HEADS=ref_data["num_heads"],
+                    HEAD_DIM=64,
+                    q_strides=ref_data["grad_q_prof"].stride(),
+                    k_strides=ref_data["grad_k_prof"].stride(),
+                    v_strides=ref_data["grad_v_prof"].stride(),
+                    maxrregcount=config["maxrregcount"],
+                    swizzle_x=config.get("swizzle_x", 8),
+                    atom_layout_mnk=config.get("atom_layout_mnk", None)
+                )
+                grad_x_prof = torch.empty(prof_M, prof_N, device=device, dtype=torch.bfloat16)
+                
+                dx_kernel(ref_data["grad_q_prof"], ref_data["grad_k_prof"], ref_data["grad_v_prof"], ref_data["weight_prof"], grad_x_prof)
+                
+                diff = (grad_x_prof - ref_data["ref_grad_x"]).abs().max().item()
+                if diff > 1e-1 or torch.isnan(grad_x_prof).any() or torch.isinf(grad_x_prof).any():
+                    print(f"[Autotune] bwd_dx config {config} failed correctness: diff={diff}, has_nan={torch.isnan(grad_x_prof).any()}, has_inf={torch.isinf(grad_x_prof).any()}")
+                    return float("inf")
+                
+                torch.cuda.synchronize()
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+                for _ in range(15):
+                    dx_kernel(ref_data["grad_q_prof"], ref_data["grad_k_prof"], ref_data["grad_v_prof"], ref_data["weight_prof"], grad_x_prof)
+                end_event.record()
+                torch.cuda.synchronize()
+                return start_event.elapsed_time(end_event) / 15.0
+                
+            elif mode == "bwd_dw":
+                from flash_attn_prologue.gemm_bwd import get_matmul_bwd_dw_kernel
+                split_k = config.get("SPLIT_K", 1)
+                dw_kernel = get_matmul_bwd_dw_kernel(
+                    num_warps=config["num_warps"],
+                    BLOCK_M=config["BLOCK_M"],
+                    BLOCK_N=config["BLOCK_N"],
+                    BLOCK_K_STAGE=config["BLOCK_K"],
+                    ab_stage=config["ab_stage"],
+                    B=ref_data["B_prof"],
+                    N=ref_data["N_seq_prof"],
+                    M_dim=prof_M,
+                    K_dim=prof_K,
+                    N_dim=prof_N,
+                    NUM_HEADS=ref_data["num_heads"],
+                    HEAD_DIM=64,
+                    q_strides=ref_data["grad_q_prof"].stride(),
+                    k_strides=ref_data["grad_k_prof"].stride(),
+                    v_strides=ref_data["grad_v_prof"].stride(),
+                    maxrregcount=config["maxrregcount"],
+                    SPLIT_K=split_k,
+                    swizzle_x=config.get("swizzle_x", 8),
+                    accumulate=False,
+                    atom_layout_mnk=config.get("atom_layout_mnk", None)
+                )
+                grad_weight_prof = torch.zeros((split_k * prof_M, prof_N), device=device, dtype=torch.float32)
+                
+                dw_kernel(ref_data["grad_q_prof"], ref_data["grad_k_prof"], ref_data["grad_v_prof"], ref_data["x_prof"], grad_weight_prof)
+                
+                if split_k > 1:
+                    grad_weight_prof_summed = grad_weight_prof.view(split_k, prof_M, prof_N).sum(dim=0).to(torch.bfloat16)
+                else:
+                    grad_weight_prof_summed = grad_weight_prof.to(torch.bfloat16)
+                    
+                diff = (grad_weight_prof_summed - ref_data["ref_grad_weight"]).abs().max().item()
+                if diff > 0.3 or torch.isnan(grad_weight_prof_summed).any() or torch.isinf(grad_weight_prof_summed).any():
+                    print(f"[Autotune] bwd_dw config {config} failed correctness: diff={diff}, has_nan={torch.isnan(grad_weight_prof_summed).any()}, has_inf={torch.isinf(grad_weight_prof_summed).any()}")
+                    return float("inf")
+                
+                torch.cuda.synchronize()
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+                for _ in range(15):
+                    dw_kernel(ref_data["grad_q_prof"], ref_data["grad_k_prof"], ref_data["grad_v_prof"], ref_data["x_prof"], grad_weight_prof)
+                end_event.record()
+                torch.cuda.synchronize()
+                return start_event.elapsed_time(end_event) / 15.0
+                
             elif mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
                 from flash_attn_prologue.fused_epilogue import get_fused_epilogue_kernel, get_fused_epilogue_back_kernel
                 
@@ -348,12 +458,8 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                 warps = config["num_warps"]
                 regs = config["maxrregcount"]
                 
-                if prof_M % bm != 0:
-                    continue
-                
                 num_heads = N
                 head_dim = K
-                
                 B_prof = 2
                 seq_prof = prof_M // 2
                 
@@ -363,11 +469,6 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                 scales_prof = torch.randn(num_heads, 1, 1, device=device, dtype=torch.float32)
                 sin_prof = torch.randn(B_prof, 1, seq_prof, head_dim, device=device, dtype=torch.float32)
                 cos_prof = torch.randn(B_prof, 1, seq_prof, head_dim, device=device, dtype=torch.float32)
-                
-                q_strides = q_prof.stride()
-                k_strides = k_prof.stride()
-                sin_strides = sin_prof.stride()
-                cos_strides = cos_prof.stride()
                 
                 fwd_kernel = None
                 back_kernel = None
@@ -380,10 +481,10 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                         HEAD_DIM=head_dim,
                         HEAD_GROUP=hg,
                         ab_stage=config.get("ab_stage", 1),
-                        q_strides=q_strides,
-                        k_strides=k_strides,
-                        sin_strides=sin_strides,
-                        cos_strides=cos_strides,
+                        q_strides=q_prof.stride(),
+                        k_strides=k_prof.stride(),
+                        sin_strides=sin_prof.stride(),
+                        cos_strides=cos_prof.stride(),
                         maxrregcount=regs
                     )
                 
@@ -395,10 +496,10 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                         HEAD_DIM=head_dim,
                         HEAD_GROUP=hg,
                         ab_stage=1,
-                        q_strides=q_strides,
-                        k_strides=k_strides,
-                        sin_strides=sin_strides,
-                        cos_strides=cos_strides,
+                        q_strides=q_prof.stride(),
+                        k_strides=k_prof.stride(),
+                        sin_strides=sin_prof.stride(),
+                        cos_strides=cos_prof.stride(),
                         maxrregcount=regs
                     )
                 
@@ -410,16 +511,15 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                 ds_prof = torch.zeros((num_heads, 1, 1), device=device, dtype=torch.float32)
                 
                 # Warmup
-                for _ in range(3):
-                    if fwd_kernel is not None:
-                        fwd_kernel(q_prof, k_prof, rmsnorm_weight_prof, scales_prof, sin_prof, cos_prof)
-                    if back_kernel is not None:
-                        back_kernel(
-                            q_prof, k_prof, rmsnorm_weight_prof, scales_prof, sin_prof, cos_prof,
-                            grad_q_prof, grad_k_prof, dq_prof, dk_prof, dw_prof, ds_prof
-                        )
-                torch.cuda.synchronize()
+                if fwd_kernel is not None:
+                    fwd_kernel(q_prof, k_prof, rmsnorm_weight_prof, scales_prof, sin_prof, cos_prof)
+                if back_kernel is not None:
+                    back_kernel(
+                        q_prof, k_prof, rmsnorm_weight_prof, scales_prof, sin_prof, cos_prof,
+                        grad_q_prof, grad_k_prof, dq_prof, dk_prof, dw_prof, ds_prof
+                    )
                 
+                torch.cuda.synchronize()
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
                 start_event.record()
@@ -433,161 +533,339 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                         )
                 end_event.record()
                 torch.cuda.synchronize()
-                curr_ms = start_event.elapsed_time(end_event) / 15.0
-            elif mode == "bwd_dx":
-                from flash_attn_prologue.gemm_bwd import get_matmul_bwd_dx_kernel
-                
-                stage = config["ab_stage"]
-                warps = config["num_warps"]
-                regs = config["maxrregcount"]
-                
-                if prof_M % bm != 0 or prof_N % bn != 0:
-                    continue
-                    
-                B_prof = 32
-                N_seq_prof = 512
-                
-                grad_q_prof = torch.randn(B_prof, 16, N_seq_prof, 64, device=device, dtype=torch.bfloat16)
-                grad_k_prof = torch.randn(B_prof, 16, N_seq_prof, 64, device=device, dtype=torch.bfloat16)
-                grad_v_prof = torch.randn(B_prof, 16, N_seq_prof, 64, device=device, dtype=torch.bfloat16)
-                weight_prof = torch.randn(prof_K, prof_N, device=device, dtype=torch.bfloat16)
-                grad_x_prof = torch.empty(prof_M, prof_N, device=device, dtype=torch.bfloat16)
-                
-                dx_kernel = get_matmul_bwd_dx_kernel(
-                    num_warps=warps,
-                    BLOCK_M=bm,
-                    BLOCK_N=bn,
-                    BLOCK_K_STAGE=bk,
-                    ab_stage=stage,
-                    B=B_prof,
-                    N=N_seq_prof,
-                    K_dim=prof_K,
-                    N_dim=prof_N,
-                    q_strides=grad_q_prof.stride(),
-                    k_strides=grad_k_prof.stride(),
-                    v_strides=grad_v_prof.stride(),
-                    maxrregcount=regs,
-                    swizzle_x=config.get("swizzle_x", 8)
-                )
-                
-                for _ in range(3):
-                    dx_kernel(grad_q_prof, grad_k_prof, grad_v_prof, weight_prof, grad_x_prof)
-                torch.cuda.synchronize()
-                
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event = torch.cuda.Event(enable_timing=True)
-                start_event.record()
-                for _ in range(15):
-                    dx_kernel(grad_q_prof, grad_k_prof, grad_v_prof, weight_prof, grad_x_prof)
-                end_event.record()
-                torch.cuda.synchronize()
-                curr_ms = start_event.elapsed_time(end_event) / 15.0
-            elif mode == "bwd_dw":
-                from flash_attn_prologue.gemm_bwd import get_matmul_bwd_dw_kernel
-                
-                stage = config["ab_stage"]
-                warps = config["num_warps"]
-                regs = config["maxrregcount"]
-                
-                if prof_M % bm != 0 or prof_N % bn != 0:
-                    continue
-                    
-                B_prof = 32
-                N_seq_prof = 512
-                split_k = config.get("SPLIT_K", 1)
-                
-                grad_q_prof = torch.randn(B_prof, 16, N_seq_prof, 64, device=device, dtype=torch.bfloat16)
-                grad_k_prof = torch.randn(B_prof, 16, N_seq_prof, 64, device=device, dtype=torch.bfloat16)
-                grad_v_prof = torch.randn(B_prof, 16, N_seq_prof, 64, device=device, dtype=torch.bfloat16)
-                x_prof = torch.randn(prof_K, prof_N, device=device, dtype=torch.bfloat16)
-                grad_weight_prof = torch.zeros((split_k * prof_M, prof_N), device=device, dtype=torch.float32)
-                
-                dw_kernel = get_matmul_bwd_dw_kernel(
-                    num_warps=warps,
-                    BLOCK_M=bm,
-                    BLOCK_N=bn,
-                    BLOCK_K_STAGE=bk,
-                    ab_stage=stage,
-                    B=B_prof,
-                    N=N_seq_prof,
-                    M_dim=prof_M,
-                    K_dim=prof_K,
-                    N_dim=prof_N,
-                    q_strides=grad_q_prof.stride(),
-                    k_strides=grad_k_prof.stride(),
-                    v_strides=grad_v_prof.stride(),
-                    maxrregcount=regs,
-                    SPLIT_K=config.get("SPLIT_K", 1),
-                    swizzle_x=config.get("swizzle_x", 8)
-                )
-                
-                for _ in range(3):
-                    dw_kernel(grad_q_prof, grad_k_prof, grad_v_prof, x_prof, grad_weight_prof)
-                torch.cuda.synchronize()
-                
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event = torch.cuda.Event(enable_timing=True)
-                start_event.record()
-                for _ in range(15):
-                    dw_kernel(grad_q_prof, grad_k_prof, grad_v_prof, x_prof, grad_weight_prof)
-                end_event.record()
-                torch.cuda.synchronize()
-                curr_ms = start_event.elapsed_time(end_event) / 15.0
+                return start_event.elapsed_time(end_event) / 15.0
             else:
-                from archive.flash_attn_prologue.pipelined_gemm import get_pipelined_gemm_fwd_kernel
-                
-                if prof_M % bm != 0 or prof_N % bn != 0:
+                return float("inf")
+        except BaseException as e:
+            import traceback
+            print(f"[Autotune] Profiling failed for config {config}. Error: {e}")
+            traceback.print_exc()
+            return float("inf")
+
+    # ------------------ STAGE 1: TILE SWEEP ------------------
+    tile_candidates = []
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.nvgpu import cpasync
+    
+    if mode == "fused_qkv":
+        for hg in [1, 2, 4, 8, 16]:
+            if N % hg != 0:
+                continue
+            for bm in [16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256]:
+                if prof_M % bm != 0:
                     continue
+                for bk in [16, 32, 48, 64, 80, 96, 112, 128]:
+                    if prof_K % bk != 0:
+                        continue
+                    
+                    # occupancy / static footprint checks
+                    num_threads = 128  # default Stage 1 warps=4
+                    if num_threads < bm * hg:
+                        continue
+                    block_n = hg * 3 * 64
+                    mainloop_bytes = (3 * bm * bk * 2) + (3 * block_n * bk * 2)
+                    epilogue_bytes = bm * (block_n + 8) * 4
+                    smem_bytes = max(mainloop_bytes, epilogue_bytes)
+                    if smem_bytes <= 99 * 1024:
+                        candidate = {
+                            "HEAD_GROUP": hg,
+                            "BLOCK_M": bm,
+                            "BLOCK_K": bk,
+                            "ab_stage": 3,
+                            "num_warps": 4,
+                            "maxrregcount": 255,
+                            "swizzle_x": 8,
+                            "atom_layout_mnk": None
+                        }
+                        if is_config_valid(candidate, mode):
+                            tile_candidates.append(candidate)
+    elif mode == "bwd_dx":
+        for bm in [16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256]:
+            if prof_M % bm != 0:
+                continue
+            for bn in [16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256]:
+                if prof_N % bn != 0:
+                    continue
+                for bk in [16, 32, 48, 64, 80, 96, 112, 128]:
+                    if prof_K % bk != 0:
+                        continue
+                    
+                    sX_bytes = 3 * bm * bk * 3 * 2
+                    sW_bytes = 3 * bn * bk * 3 * 2
+                    mainloop_bytes = sX_bytes + sW_bytes
+                    epilogue_bytes = bm * (bn + 8) * 2
+                    smem_bytes = max(mainloop_bytes, epilogue_bytes)
+                    if smem_bytes <= 99 * 1024:
+                        candidate = {
+                            "BLOCK_M": bm,
+                            "BLOCK_N": bn,
+                            "BLOCK_K": bk,
+                            "ab_stage": 3,
+                            "num_warps": 4,
+                            "maxrregcount": 255,
+                            "swizzle_x": 8,
+                            "atom_layout_mnk": None
+                        }
+                        if is_config_valid(candidate, mode):
+                            tile_candidates.append(candidate)
+    elif mode == "bwd_dw":
+        for bm in [16, 32, 64]:  # restricted to <= 64 (HEAD_DIM limit)
+            if (prof_M // 3) % bm != 0:
+                continue
+            for bn in [16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256]:
+                if prof_N % bn != 0:
+                    continue
+                for bk in [16, 32, 48, 64, 80, 96, 112, 128]:
+                    if prof_K % bk != 0:
+                        continue
+                        
+                    sX_bytes = 3 * bm * bk * 3 * 2
+                    sW_bytes = 3 * bn * bk * 2
+                    mainloop_bytes = sX_bytes + sW_bytes
+                    epilogue_bytes = 3 * bm * (bn + 8) * 2
+                    smem_bytes = max(mainloop_bytes, epilogue_bytes)
+                    if smem_bytes <= 99 * 1024:
+                        candidate = {
+                            "BLOCK_M": bm,
+                            "BLOCK_N": bn,
+                            "BLOCK_K": bk,
+                            "ab_stage": 3,
+                            "num_warps": 4,
+                            "maxrregcount": 255,
+                            "SPLIT_K": 4,
+                            "swizzle_x": 8,
+                            "atom_layout_mnk": None
+                        }
+                        if is_config_valid(candidate, mode):
+                            tile_candidates.append(candidate)
+    elif mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
+        for hg in [1, 2, 4, 8, 16]:
+            if mode in ("epilogue", "epilogue_fwd") and hg > 2:
+                continue
+            if N % hg != 0:
+                continue
+            for bm in [16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256]:
+                if prof_M % bm != 0:
+                    continue
+                stage = 1
+                warps = 4
+                regs = 255
                 
-                fwd_kernel = get_pipelined_gemm_fwd_kernel(
-                    num_warps=4,
-                    BLOCK_M=bm,
-                    BLOCK_N=bn,
-                    BLOCK_K=bk,
-                    hidden=prof_K,
-                    out_features=prof_N
-                )
-                
-                B_prof = 2
-                seq_prof = prof_M // 2
-                x_prof = torch.randn(B_prof, seq_prof, prof_K, device=device, dtype=torch.bfloat16)
-                weight_prof = torch.randn(prof_N, prof_K, device=device, dtype=torch.bfloat16)
-                out_prof = torch.empty(B_prof, seq_prof, prof_N, device=device, dtype=torch.bfloat16)
-                
-                # Warmup
-                for _ in range(3):
-                    fwd_kernel(x_prof, weight_prof, out_prof)
-                torch.cuda.synchronize()
-                
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event = torch.cuda.Event(enable_timing=True)
-                start_event.record()
-                for _ in range(15):
-                    fwd_kernel(x_prof, weight_prof, out_prof)
-                end_event.record()
-                torch.cuda.synchronize()
-                curr_ms = start_event.elapsed_time(end_event) / 15.0
-                
-            if curr_ms < best_time:
-                best_time = curr_ms
-                best_config = config
-        except Exception:
-            continue
-            
-    if best_config is None:
-        if mode == "fused_qkv":
-            best_config = {"HEAD_GROUP": 1, "BLOCK_M": 64, "BLOCK_K": 16, "ab_stage": 3, "num_warps": 4, "maxrregcount": 255}
-        elif mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
-            best_config = {"HEAD_GROUP": 2, "BLOCK_M": 64, "ab_stage": 1, "num_warps": 4, "maxrregcount": 255}
-        elif mode == "fused":
-            best_config = {"HEAD_GROUP": 2, "BLOCK_M": 64, "BLOCK_N": 384, "BLOCK_K": 32}
-        elif mode == "bwd_dx":
-            best_config = {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "ab_stage": 3, "num_warps": 4, "maxrregcount": 255}
-        elif mode == "bwd_dw":
-            best_config = {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "ab_stage": 3, "num_warps": 4, "maxrregcount": 255}
-        else:
-            best_config = {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}
+                if mode == "epilogue_bwd":
+                    s_rmsnorm_reduction_elems = bm * 2 * hg * K
+                    s_scales_offset = ((s_rmsnorm_reduction_elems + 31) // 32) * 32
+                    total_elems = s_scales_offset + bm * hg
+                    flat_smem_elements = ((total_elems + 31) // 32) * 32
+                    smem_bytes = flat_smem_elements * 4
+                else:
+                    block_n = hg * K
+                    block_n_padded = block_n + 8
+                    smem_bytes = 2 * (bm * block_n_padded * 2)
+                    if mode == "epilogue":
+                        s_rmsnorm_reduction_elems = bm * 2 * hg * K
+                        s_scales_offset = ((s_rmsnorm_reduction_elems + 31) // 32) * 32
+                        total_elems = s_scales_offset + bm * hg
+                        flat_smem_elements = ((total_elems + 31) // 32) * 32
+                        bwd_smem_bytes = flat_smem_elements * 4
+                        smem_bytes = max(smem_bytes, bwd_smem_bytes)
+                        
+                if smem_bytes <= 99 * 1024:
+                    candidate = {
+                        "HEAD_GROUP": hg,
+                        "BLOCK_M": bm,
+                        "BLOCK_K": K,
+                        "ab_stage": stage,
+                        "num_warps": warps,
+                        "maxrregcount": regs,
+                        "atom_layout_mnk": None
+                    }
+                    if is_config_valid(candidate, mode):
+                        tile_candidates.append(candidate)
+    else:
+        tile_candidates = [
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64},
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 128},
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 128},
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128},
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64},
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64},
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64},
+        ]
         
+    if not tile_candidates:
+        if mode == "fused_qkv":
+            return {"HEAD_GROUP": 1, "BLOCK_M": 64, "BLOCK_K": 16, "ab_stage": 3, "num_warps": 4, "maxrregcount": 255, "swizzle_x": 8, "atom_layout_mnk": None}
+        elif mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
+            return {"HEAD_GROUP": 2, "BLOCK_M": 64, "ab_stage": 1, "num_warps": 4, "maxrregcount": 255, "atom_layout_mnk": None}
+        elif mode == "bwd_dx":
+            return {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "ab_stage": 3, "num_warps": 4, "maxrregcount": 255, "swizzle_x": 8, "atom_layout_mnk": None}
+        elif mode == "bwd_dw":
+            return {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "ab_stage": 2, "num_warps": 4, "maxrregcount": 255, "SPLIT_K": 16, "swizzle_x": 8, "atom_layout_mnk": None}
+        else:
+            return {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}
+
+    print(f"[Autotune] Stage 1: Sweep over {len(tile_candidates)} tile configurations...")
+    tile_results = []
+    for t_config in tile_candidates:
+        t_ms = profile_and_verify(t_config)
+        if t_ms < float("inf"):
+            tile_results.append((t_ms, t_config))
+            
+    tile_results.sort(key=lambda x: x[0])
+    top_tiles = [item[1] for item in tile_results[:5]]
+    
+    if not top_tiles:
+        if mode == "fused_qkv":
+            return {"HEAD_GROUP": 1, "BLOCK_M": 64, "BLOCK_K": 16, "ab_stage": 3, "num_warps": 4, "maxrregcount": 255, "swizzle_x": 8, "atom_layout_mnk": None}
+        elif mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
+            return {"HEAD_GROUP": 2, "BLOCK_M": 64, "ab_stage": 1, "num_warps": 4, "maxrregcount": 255, "atom_layout_mnk": None}
+        elif mode == "bwd_dx":
+            return {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "ab_stage": 3, "num_warps": 4, "maxrregcount": 255, "swizzle_x": 8, "atom_layout_mnk": None}
+        elif mode == "bwd_dw":
+            return {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "ab_stage": 2, "num_warps": 4, "maxrregcount": 255, "SPLIT_K": 16, "swizzle_x": 8, "atom_layout_mnk": None}
+        else:
+            return {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}
+            
+    print(f"[Autotune] Stage 1 Completed. Top tile configurations: {top_tiles}")
+    
+    # ------------------ STAGE 2: WARP COUNT & LAYOUT SWEEP ------------------
+    stage_2_candidates = []
+    for tile in top_tiles:
+        warp_choices = [2, 4, 8, 12, 16] if mode in ("epilogue", "epilogue_fwd", "epilogue_bwd") else [2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16]
+        for warps in warp_choices:
+            layouts = (get_valid_warp_layouts(warps) if mode not in ("epilogue", "epilogue_fwd", "epilogue_bwd") else [None])
+            for w_layout in layouts:
+                candidate = tile.copy()
+                candidate["num_warps"] = warps
+                candidate["atom_layout_mnk"] = w_layout
+                if is_config_valid(candidate, mode):
+                    stage_2_candidates.append(candidate)
+                
+    print(f"[Autotune] Stage 2: Sweep over {len(stage_2_candidates)} warp count & layout configurations...")
+    stage_2_results = []
+    for exec_config in stage_2_candidates:
+        exec_ms = profile_and_verify(exec_config)
+        if exec_ms < float("inf"):
+            stage_2_results.append((exec_ms, exec_config))
+            
+    stage_2_results.sort(key=lambda x: x[0])
+    if not stage_2_results:
+        best_stage_2 = top_tiles[0]
+    else:
+        best_stage_2 = stage_2_results[0][1]
+        
+    print(f"[Autotune] Stage 2 Completed. Best warp/layout setup: {best_stage_2}")
+    
+    # ------------------ STAGE 3: PIPELINING & PARALLELISM SWEEP ------------------
+    stage_3_candidates = []
+    stages_to_sweep = [2, 3, 4, 5, 6, 7, 8, 9, 10] if mode not in ("epilogue", "epilogue_fwd", "epilogue_bwd") else ([1, 2] if mode in ("epilogue", "epilogue_fwd") else [1])
+    split_k_to_sweep = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128] if mode == "bwd_dw" else [1]
+    
+    for stage in stages_to_sweep:
+        if mode in ("epilogue", "epilogue_fwd"):
+            if best_stage_2["BLOCK_M"] % stage != 0:
+                continue
+            num_threads = best_stage_2["num_warps"] * 32
+            if mode == "epilogue_fwd":
+                required_threads = (best_stage_2["BLOCK_M"] // stage) * best_stage_2["HEAD_GROUP"]
+            else:
+                required_threads = max((best_stage_2["BLOCK_M"] // stage) * best_stage_2["HEAD_GROUP"], best_stage_2["BLOCK_M"] * best_stage_2["HEAD_GROUP"])
+            if num_threads < required_threads:
+                continue
+
+        for split_k in split_k_to_sweep:
+            # Check dynamic shared memory size limit
+            if mode == "fused_qkv":
+                block_n = best_stage_2["HEAD_GROUP"] * 3 * 64
+                mainloop_bytes = (stage * best_stage_2["BLOCK_M"] * best_stage_2["BLOCK_K"] * 2) + (stage * block_n * best_stage_2["BLOCK_K"] * 2)
+                epilogue_bytes = best_stage_2["BLOCK_M"] * (block_n + 8) * 4
+                smem_bytes = max(mainloop_bytes, epilogue_bytes)
+            elif mode == "bwd_dx":
+                sX_bytes = stage * best_stage_2["BLOCK_M"] * best_stage_2["BLOCK_K"] * 3 * 2
+                sW_bytes = stage * best_stage_2["BLOCK_N"] * best_stage_2["BLOCK_K"] * 3 * 2
+                mainloop_bytes = sX_bytes + sW_bytes
+                epilogue_bytes = best_stage_2["BLOCK_M"] * (best_stage_2["BLOCK_N"] + 8) * 2
+                smem_bytes = max(mainloop_bytes, epilogue_bytes)
+            elif mode == "bwd_dw":
+                sX_bytes = stage * best_stage_2["BLOCK_M"] * best_stage_2["BLOCK_K"] * 3 * 2
+                sW_bytes = stage * best_stage_2["BLOCK_N"] * best_stage_2["BLOCK_K"] * 2
+                mainloop_bytes = sX_bytes + sW_bytes
+                epilogue_bytes = 3 * best_stage_2["BLOCK_M"] * (best_stage_2["BLOCK_N"] + 8) * 2
+                smem_bytes = max(mainloop_bytes, epilogue_bytes)
+            elif mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
+                if mode == "epilogue_bwd":
+                    s_rmsnorm_reduction_elems = best_stage_2["BLOCK_M"] * 2 * best_stage_2["HEAD_GROUP"] * K
+                    s_scales_offset = ((s_rmsnorm_reduction_elems + 31) // 32) * 32
+                    total_elems = s_scales_offset + best_stage_2["BLOCK_M"] * best_stage_2["HEAD_GROUP"]
+                    flat_smem_elements = ((total_elems + 31) // 32) * 32
+                    smem_bytes = flat_smem_elements * 4
+                else:
+                    block_n = best_stage_2["HEAD_GROUP"] * K
+                    block_n_padded = block_n + 8
+                    smem_bytes = 2 * (best_stage_2["BLOCK_M"] * block_n_padded * 2)
+                    if mode == "epilogue":
+                        s_rmsnorm_reduction_elems = best_stage_2["BLOCK_M"] * 2 * best_stage_2["HEAD_GROUP"] * K
+                        s_scales_offset = ((s_rmsnorm_reduction_elems + 31) // 32) * 32
+                        total_elems = s_scales_offset + best_stage_2["BLOCK_M"] * best_stage_2["HEAD_GROUP"]
+                        flat_smem_elements = ((total_elems + 31) // 32) * 32
+                        bwd_smem_bytes = flat_smem_elements * 4
+                        smem_bytes = max(smem_bytes, bwd_smem_bytes)
+            else:
+                smem_bytes = 0
+                
+            if smem_bytes <= 99 * 1024:
+                candidate = best_stage_2.copy()
+                candidate["ab_stage"] = stage
+                if mode == "bwd_dw":
+                    candidate["SPLIT_K"] = split_k
+                if is_config_valid(candidate, mode):
+                    stage_3_candidates.append(candidate)
+                
+    print(f"[Autotune] Stage 3: Sweep over {len(stage_3_candidates)} pipelining & parallelism configurations...")
+    stage_3_results = []
+    for exec_config in stage_3_candidates:
+        exec_ms = profile_and_verify(exec_config)
+        if exec_ms < float("inf"):
+            stage_3_results.append((exec_ms, exec_config))
+            
+    stage_3_results.sort(key=lambda x: x[0])
+    if not stage_3_results:
+        best_stage_3 = best_stage_2
+    else:
+        best_stage_3 = stage_3_results[0][1]
+        
+    print(f"[Autotune] Stage 3 Completed. Best stage/split-K setup: {best_stage_3}")
+    
+    # ------------------ STAGE 4: COMPILER & SWIZZLE CONFIGURATIONS ------------------
+    stage_4_candidates = []
+    regs_to_sweep = [80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 255] if mode not in ("epilogue", "epilogue_fwd", "epilogue_bwd") else [128, 255]
+    swizzles_to_sweep = [1, 2, 4, 8, 16, 32, 64] if mode not in ("epilogue", "epilogue_fwd", "epilogue_bwd") else [1]
+    
+    for regs in regs_to_sweep:
+        for swizzle in swizzles_to_sweep:
+            candidate = best_stage_3.copy()
+            candidate["maxrregcount"] = regs
+            if mode not in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
+                candidate["swizzle_x"] = swizzle
+            stage_4_candidates.append(candidate)
+            
+    print(f"[Autotune] Stage 4: Sweep over {len(stage_4_candidates)} compiler & swizzle configurations...")
+    stage_4_results = []
+    for exec_config in stage_4_candidates:
+        exec_ms = profile_and_verify(exec_config)
+        if exec_ms < float("inf"):
+            stage_4_results.append((exec_ms, exec_config))
+            
+    stage_4_results.sort(key=lambda x: x[0])
+    if not stage_4_results:
+        best_config = best_stage_3
+        best_time = float("inf")
+    else:
+        best_config = stage_4_results[0][1]
+        best_time = stage_4_results[0][0]
+        
+    print(f"[Autotune] Selection completed. Best config for mode {mode}: {best_config} with time: {best_time:.4f} ms")
     return best_config
  
 def get_autotuned_config(M: int, N: int, K: int, is_fused: Any, device: str = "cuda") -> Dict[str, int]:

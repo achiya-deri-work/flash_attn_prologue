@@ -116,6 +116,14 @@ def test_cute_fused_qkv_forward_parity_and_benchmark():
         print(f"\n--- Detailed Numerical Accuracy for {label} ---")
         print(f"Max Absolute Difference: {max_abs:.6f}")
         print(f"Mean Absolute Difference: {mean_abs:.6f}")
+        
+        if max_abs > 0.1:
+            mismatched_indices = torch.nonzero(diff > 0.1)
+            print(f"Number of mismatched elements (>0.1): {len(mismatched_indices)}")
+            print("First 10 mismatched elements:")
+            for idx in mismatched_indices[:10]:
+                idx_tuple = tuple(idx.tolist())
+                print(f"  Index {idx_tuple}: CuTe = {c_tensor[idx_tuple].item():.4f}, Eager = {e_tensor[idx_tuple].item():.4f}, diff = {diff[idx_tuple].item():.4f}")
 
     print_accuracy_metrics(q_c, q_e, "Q Proj Output")
     print_accuracy_metrics(k_c, k_e, "K Proj Output")

@@ -13,6 +13,7 @@ import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Int32, Int64, Boolean, const_expr
 from cutlass.cute.nvgpu import cpasync
 from quack.compile_utils import make_fake_tensor
+from flash_attn_prologue.autotune import get_autotuned_config
 
 class FusedEpilogueCute:
     def __init__(self, num_warps: int = 4, BLOCK_M: int = 64, NUM_HEADS: int = 16, HEAD_DIM: int = 64, HEAD_GROUP: int = 1, ab_stage: int = 1, q_strides=None, k_strides=None, sin_strides=None, cos_strides=None):
@@ -54,7 +55,11 @@ class FusedEpilogueCute:
         num_threads = self.num_warps * 32
         copy_val_val_k = min(8, self.HEAD_DIM)
         copy_val_thr_k = self.HEAD_DIM // copy_val_val_k
-        copy_val_thr_m = min(num_threads // copy_val_thr_k, self.SUB_M)
+        max_thr_m = num_threads // copy_val_thr_k
+        copy_val_thr_m = 1
+        for d in range(1, self.SUB_M + 1):
+            if self.SUB_M % d == 0 and d <= max_thr_m:
+                copy_val_thr_m = d
         self.copy_val_threads = copy_val_thr_m * copy_val_thr_k
         self.gmem_tiled_copy_val = cute.make_tiled_copy_tv(
             copy_atom_bf16,
@@ -590,6 +595,8 @@ def get_fused_epilogue_kernel(num_warps=4, BLOCK_M=64, NUM_HEADS=16, HEAD_DIM=64
         _epilogue_compile_cache[key] = compiled_fwd
     return _epilogue_compile_cache[key]
 
+_epilogue_fwd_kernel_cache = {}
+
 @torch.library.custom_op("flash_prologue::qknorm_rope_scale_cute", mutates_args=())
 def qknorm_rope_scale_cute_op(
     q: torch.Tensor,
@@ -600,42 +607,42 @@ def qknorm_rope_scale_cute_op(
     cos: torch.Tensor,
     eps: float = 1e-5
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    from flash_attn_prologue.autotune import get_autotuned_config
-    
     B, num_heads, N, head_dim = q.shape
     
-    # Query block configuration: dynamically retrieved from autotuner
-    config = get_autotuned_config(M=N, N=num_heads, K=head_dim, is_fused="epilogue_fwd")
-    BLOCK_M = config["BLOCK_M"]
-    HEAD_GROUP = config["HEAD_GROUP"]
-    ab_stage = config["ab_stage"]
-    num_warps = config.get("num_warps", 4)
-    maxrregcount = config.get("maxrregcount", 255)
-    
-    q_strides = q.stride()
-    k_strides = k.stride()
-    
+    shape_key = (B, N)
+    fwd_kernel = _epilogue_fwd_kernel_cache.get(shape_key)
+    if fwd_kernel is None:
+        config = get_autotuned_config(M=N, N=num_heads, K=head_dim, is_fused="epilogue_fwd")
+        BLOCK_M = config["BLOCK_M"]
+        HEAD_GROUP = config["HEAD_GROUP"]
+        ab_stage = config["ab_stage"]
+        num_warps = config.get("num_warps", 4)
+        maxrregcount = config.get("maxrregcount", 255)
+        
+        q_strides = q.stride()
+        k_strides = k.stride()
+        sin_strides = sin.stride()
+        cos_strides = cos.stride()
+        
+        fwd_kernel = get_fused_epilogue_kernel(
+            num_warps=num_warps,
+            BLOCK_M=BLOCK_M,
+            NUM_HEADS=num_heads,
+            HEAD_DIM=head_dim,
+            HEAD_GROUP=HEAD_GROUP,
+            ab_stage=ab_stage,
+            q_strides=q_strides,
+            k_strides=k_strides,
+            sin_strides=sin_strides,
+            cos_strides=cos_strides,
+            maxrregcount=maxrregcount
+        )
+        _epilogue_fwd_kernel_cache[shape_key] = fwd_kernel
+        
     rmsnorm_weight_32 = rmsnorm_weight if rmsnorm_weight.dtype == torch.float32 and rmsnorm_weight.is_contiguous() else rmsnorm_weight.to(torch.float32).contiguous()
     scales_32 = scales if scales.dtype == torch.float32 and scales.is_contiguous() else scales.to(torch.float32).contiguous()
     sin_32 = sin if sin.dtype == torch.float32 and sin.is_contiguous() else sin.to(torch.float32).contiguous()
     cos_32 = cos if cos.dtype == torch.float32 and cos.is_contiguous() else cos.to(torch.float32).contiguous()
-    
-    sin_strides = sin_32.stride()
-    cos_strides = cos_32.stride()
-    
-    fwd_kernel = get_fused_epilogue_kernel(
-        num_warps=num_warps,
-        BLOCK_M=BLOCK_M,
-        NUM_HEADS=num_heads,
-        HEAD_DIM=head_dim,
-        HEAD_GROUP=HEAD_GROUP,
-        ab_stage=ab_stage,
-        q_strides=q_strides,
-        k_strides=k_strides,
-        sin_strides=sin_strides,
-        cos_strides=cos_strides,
-        maxrregcount=maxrregcount
-    )
     
     q_out = q.clone()
     k_out = k.clone()
@@ -1085,6 +1092,8 @@ def get_fused_epilogue_back_kernel(num_warps=4, BLOCK_M=64, NUM_HEADS=16, HEAD_D
         _epilogue_back_compile_cache[key] = compiled_back
     return _epilogue_back_compile_cache[key]
 
+_epilogue_bwd_kernel_cache = {}
+
 @torch.library.custom_op("flash_prologue::qknorm_rope_scale_cute_backward", mutates_args=())
 def qknorm_rope_scale_cute_backward_op(
     q: torch.Tensor,
@@ -1097,8 +1106,6 @@ def qknorm_rope_scale_cute_backward_op(
     grad_k_out: torch.Tensor,
     eps: float = 1e-5
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    from flash_attn_prologue.autotune import get_autotuned_config
-    
     B, num_heads, N, head_dim = q.shape
     
     if grad_q_out.stride() != q.stride():
@@ -1110,18 +1117,36 @@ def qknorm_rope_scale_cute_backward_op(
         grad_k_out_matched.copy_(grad_k_out)
         grad_k_out = grad_k_out_matched
         
-    config = get_autotuned_config(M=N, N=num_heads, K=head_dim, is_fused="epilogue_bwd")
-    BLOCK_M = config["BLOCK_M"]
-    HEAD_GROUP = config["HEAD_GROUP"]
-    ab_stage = config["ab_stage"]
-    num_warps = config.get("num_warps", 4)
-    maxrregcount = config.get("maxrregcount", 255)
-    
-    q_strides = q.stride()
-    k_strides = k.stride()
-    sin_strides = sin.stride()
-    cos_strides = cos.stride()
-    
+    shape_key = (B, N)
+    back_kernel = _epilogue_bwd_kernel_cache.get(shape_key)
+    if back_kernel is None:
+        config = get_autotuned_config(M=N, N=num_heads, K=head_dim, is_fused="epilogue_bwd")
+        BLOCK_M = config["BLOCK_M"]
+        HEAD_GROUP = config["HEAD_GROUP"]
+        ab_stage = config["ab_stage"]
+        num_warps = config.get("num_warps", 4)
+        maxrregcount = config.get("maxrregcount", 255)
+        
+        q_strides = q.stride()
+        k_strides = k.stride()
+        sin_strides = sin.stride()
+        cos_strides = cos.stride()
+        
+        back_kernel = get_fused_epilogue_back_kernel(
+            num_warps=num_warps,
+            BLOCK_M=BLOCK_M,
+            NUM_HEADS=num_heads,
+            HEAD_DIM=head_dim,
+            HEAD_GROUP=HEAD_GROUP,
+            ab_stage=ab_stage,
+            q_strides=q_strides,
+            k_strides=k_strides,
+            sin_strides=sin_strides,
+            cos_strides=cos_strides,
+            maxrregcount=maxrregcount
+        )
+        _epilogue_bwd_kernel_cache[shape_key] = back_kernel
+        
     grad_q = torch.empty_like(q)
     grad_k = torch.empty_like(k)
     grad_rmsnorm_weight = torch.zeros((2, 1, head_dim), device=q.device, dtype=torch.float32)
@@ -1131,23 +1156,6 @@ def qknorm_rope_scale_cute_backward_op(
     scales_32 = scales if scales.dtype == torch.float32 and scales.is_contiguous() else scales.to(torch.float32).contiguous()
     sin_32 = sin if sin.dtype == torch.float32 and sin.is_contiguous() else sin.to(torch.float32).contiguous()
     cos_32 = cos if cos.dtype == torch.float32 and cos.is_contiguous() else cos.to(torch.float32).contiguous()
-    
-    sin_strides = sin_32.stride()
-    cos_strides = cos_32.stride()
-    
-    back_kernel = get_fused_epilogue_back_kernel(
-        num_warps=num_warps,
-        BLOCK_M=BLOCK_M,
-        NUM_HEADS=num_heads,
-        HEAD_DIM=head_dim,
-        HEAD_GROUP=HEAD_GROUP,
-        ab_stage=ab_stage,
-        q_strides=q_strides,
-        k_strides=k_strides,
-        sin_strides=sin_strides,
-        cos_strides=cos_strides,
-        maxrregcount=maxrregcount
-    )
     
     back_kernel(
         q, k, rmsnorm_weight_32, scales_32, sin_32, cos_32,
