@@ -71,31 +71,43 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
     elif mode in ("bwd_dx", "bwd_dw"):
         candidates = []
         if mode == "bwd_dx":
-            # dx requires 128x128 and ab_stage = 3 to avoid Write-After-Read race conditions / NaNs
-            candidates.append({
-                "BLOCK_M": 128,
-                "BLOCK_N": 128,
-                "BLOCK_K": 32,
-                "ab_stage": 3,
-                "num_warps": 4,
-                "maxrregcount": 255
-            })
+            # Test different BLOCK_K and stage options for dx (M=128, N=128)
+            for bk in [32, 64]:
+                for stage in [2, 3]:
+                    sX_bytes = stage * 128 * bk * 2
+                    sW_bytes = stage * 128 * bk * 2
+                    mainloop_bytes = sX_bytes + sW_bytes
+                    epilogue_bytes = 128 * 136 * 4
+                    smem_bytes = max(mainloop_bytes, epilogue_bytes)
+                    if smem_bytes <= 99 * 1024:
+                        candidates.append({
+                            "BLOCK_M": 128,
+                            "BLOCK_N": 128,
+                            "BLOCK_K": bk,
+                            "ab_stage": stage,
+                            "num_warps": 4,
+                            "maxrregcount": 255
+                        })
         else: # bwd_dw
             # Support symmetric block sizes 64x64 with 2 or 3 stages (BLOCK_M must be 64 for TMA head dimension contiguity)
             for block_size in [64]:
-                for bk in [32]:
+                for bk in [32, 64]:
                     for stage in [2, 3]:
                         for regs in [255]:
                             for split_k in [1, 2, 4, 8, 16, 32]:
-                                candidates.append({
-                                    "BLOCK_M": block_size,
-                                    "BLOCK_N": block_size,
-                                    "BLOCK_K": bk,
-                                    "ab_stage": stage,
-                                    "num_warps": 4,
-                                    "maxrregcount": regs,
-                                    "SPLIT_K": split_k
-                                })
+                                mainloop_bytes = stage * block_size * bk * 2 + stage * block_size * bk * 2
+                                epilogue_bytes = block_size * (block_size + 8) * 4
+                                smem_bytes = max(mainloop_bytes, epilogue_bytes)
+                                if smem_bytes <= 99 * 1024:
+                                    candidates.append({
+                                        "BLOCK_M": block_size,
+                                        "BLOCK_N": block_size,
+                                        "BLOCK_K": bk,
+                                        "ab_stage": stage,
+                                        "num_warps": 4,
+                                        "maxrregcount": regs,
+                                        "SPLIT_K": split_k
+                                    })
     elif mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
         candidates = []
         for hg in [1, 2, 4, 8]:
