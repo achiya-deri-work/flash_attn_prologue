@@ -254,12 +254,12 @@ graph TD
   - `sC_epi` (BFloat16, epilogue buffer): Aliased directly to `sX` memory location using pointer casting, reusing the first 32 KB of the memory chunk. (**0 KB** extra overhead).
 
 ### 5. Fused QKV Overlap Kernel Map
-- **Total Active Shared Memory:** **50 KB** (saves 49% compared to 98 KB) for the optimal config `HEAD_GROUP = 1, BLOCK_M = 64, BLOCK_K = 16, ab_stage = 3`.
+- **Total Active Shared Memory:** **98 KB** (fits under the 99 KB limit) for the optimal config `HEAD_GROUP = 2, BLOCK_M = 64, BLOCK_K = 16, ab_stage = 3`.
 - **Allocation Details:**
   - `sX` (BFloat16, 3 stages): `BLOCK_M * BLOCK_K * 3` = `64 * 16 * 3 = 3,072` elements (**6 KB**).
-  - `sW` (BFloat16, 3 stages): `BLOCK_N * BLOCK_K * 3` = `192 * 16 * 3 = 9,216` elements (**18 KB**).
-  - `sBuf` (Float32, epilogue writeback buffer): `BLOCK_M * BLOCK_N_padded` = `64 * 200 = 12,800` elements (**50 KB**).
-  - Peak SMEM utilization is exactly **50 KB** (by reusing the flat Float32 storage block of 12,800 elements for GEMM + epilogue writeback, with no frequencies buffer).
+  - `sW` (BFloat16, 3 stages): `BLOCK_N * BLOCK_K * 3` = `384 * 16 * 3 = 18,432` elements (**36.864 KB**).
+  - `sBuf` (Float32, epilogue writeback buffer): `BLOCK_M * BLOCK_N_padded` = `64 * 392 = 25,088` elements (**98 KB**).
+  - Peak SMEM utilization is exactly **98 KB** (by reusing the flat Float32 storage block of 25,088 elements for GEMM + epilogue writeback, with no frequencies buffer).
 
 ### 6. Standalone In-Place Fused Epilogue Kernel Map
 - **Total Active Shared Memory:** **34 KB** (single-stage flat allocation for `HEAD_GROUP = 2`, with padding)

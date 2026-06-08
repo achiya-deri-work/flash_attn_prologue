@@ -21,14 +21,6 @@
         "num_warps": 4,
         "maxrregcount": 255
     },
-    "16384_3072_512_overlap": {
-        "HEAD_GROUP": 1,
-        "BLOCK_M": 64,
-        "BLOCK_K": 16,
-        "ab_stage": 3,
-        "num_warps": 4,
-        "maxrregcount": 128
-    },
     "512_16_64_epilogue_fwd": {
         "HEAD_GROUP": 1,
         "BLOCK_M": 16,
@@ -67,6 +59,14 @@
         "BLOCK_K": 64,
         "ab_stage": 1,
         "num_warps": 8,
+        "maxrregcount": 255
+    },
+    "16384_3072_512_overlap": {
+        "HEAD_GROUP": 2,
+        "BLOCK_M": 64,
+        "BLOCK_K": 16,
+        "ab_stage": 3,
+        "num_warps": 4,
         "maxrregcount": 255
     }
 }

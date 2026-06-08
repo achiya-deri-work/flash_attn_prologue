@@ -301,20 +301,25 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                 x_prof = torch.randn(B_prof, seq_prof, hidden, device=device, dtype=torch.bfloat16)
                 weight_prof = torch.randn(3 * num_heads * head_dim, hidden, device=device, dtype=torch.bfloat16)
                 
+                num_heads_x_dim = num_heads * head_dim
+                weight_q_prof = weight_prof[0 : num_heads_x_dim, :]
+                weight_k_prof = weight_prof[num_heads_x_dim : 2 * num_heads_x_dim, :]
+                weight_v_prof = weight_prof[2 * num_heads_x_dim : 3 * num_heads_x_dim, :]
+                
                 q_out = torch.empty(B_prof, num_heads, seq_prof, head_dim, device=device, dtype=torch.bfloat16)
                 k_out = torch.empty(B_prof, num_heads, seq_prof, head_dim, device=device, dtype=torch.bfloat16)
                 v_out = torch.empty(B_prof, num_heads, seq_prof, head_dim, device=device, dtype=torch.bfloat16)
                 
                 # Warmup
                 for _ in range(3):
-                    fwd_kernel(x_prof, weight_prof, q_out, k_out, v_out)
+                    fwd_kernel(x_prof, weight_q_prof, weight_k_prof, weight_v_prof, q_out, k_out, v_out)
                 torch.cuda.synchronize()
                 
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
                 start_event.record()
                 for _ in range(15):
-                    fwd_kernel(x_prof, weight_prof, q_out, k_out, v_out)
+                    fwd_kernel(x_prof, weight_q_prof, weight_k_prof, weight_v_prof, q_out, k_out, v_out)
                 end_event.record()
                 torch.cuda.synchronize()
                 curr_ms = start_event.elapsed_time(end_event) / 15.0
