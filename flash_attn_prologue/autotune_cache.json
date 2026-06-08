@@ -35,12 +35,12 @@
     },
     "3072_512_16384_bwd_dw": {
         "BLOCK_M": 64,
-        "BLOCK_N": 64,
+        "BLOCK_N": 128,
         "BLOCK_K": 32,
-        "ab_stage": 3,
+        "ab_stage": 4,
         "num_warps": 4,
         "maxrregcount": 255,
         "SPLIT_K": 8,
-        "swizzle_x": 4
+        "swizzle_x": 16
     }
 }

@@ -947,28 +947,32 @@ class GemmBwdDwCute:
         cute.copy(copy_atom_r2s, accum, tCsC)
         cute.arch.sync_threads()
         
-        # Thread mapping for coalesced stores
-        threads_col = self.BLOCK_N
+        # Thread mapping for coalesced stores (supports BLOCK_N > num_threads)
+        threads_col = cutlass.min(self.BLOCK_N, num_threads)
         threads_row = num_threads // threads_col
         
         t_row = tidx // threads_col
         t_col = tidx % threads_col
         
+        cols_per_thread = self.BLOCK_N // threads_col
         rows_per_thread = self.BLOCK_M // threads_row
+        
         row_start = t_row * rows_per_thread
+        col_start = t_col * cols_per_thread
         
         if is_valid:
             for r_idx in cutlass.range(rows_per_thread):
-                curr_row = cta_m * self.BLOCK_M + row_start + r_idx
-                curr_col = cta_n * self.BLOCK_N + t_col
-                if curr_row < M_dim and curr_col < N_dim:
-                    val = smem_accum[row_start + r_idx, t_col]
-                    g_ptr = grad_weight.iterator + curr_row * N_dim + curr_col
-                    if self.SPLIT_K > 1:
-                        g_ptr_workspace = grad_weight.iterator + (block_idx_z * M_dim + curr_row) * N_dim + curr_col
-                        g_ptr_workspace[0] = val
-                    else:
-                        g_ptr[0] = val
+                for c_idx in cutlass.range(cols_per_thread):
+                    curr_row = cta_m * self.BLOCK_M + row_start + r_idx
+                    curr_col = cta_n * self.BLOCK_N + col_start + c_idx
+                    if curr_row < M_dim and curr_col < N_dim:
+                        val = smem_accum[row_start + r_idx, col_start + c_idx]
+                        g_ptr = grad_weight.iterator + curr_row * N_dim + curr_col
+                        if self.SPLIT_K > 1:
+                            g_ptr_workspace = grad_weight.iterator + (block_idx_z * M_dim + curr_row) * N_dim + curr_col
+                            g_ptr_workspace[0] = val
+                        else:
+                            g_ptr[0] = val
 
 class SplitKReductionCute:
     def __init__(self, M_dim: int, N_dim: int, SPLIT_K: int):

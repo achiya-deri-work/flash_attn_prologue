@@ -285,12 +285,12 @@ graph TD
   - Peak SMEM utilization is exactly **~68 KB** by aliasing the BFloat16 output buffer `sOut_bf16` with the `smem_accum` buffer, reducing epilogue SMEM requirements from 102 KB (violating the 99 KB limit) to 69.6 KB.
 
 ### 9. Blackwell TMA Pipelined Backward GEMM dw Kernel Map (`bwd_dw`)
-- **Total Active Shared Memory:** **~24.5 KB** (within 99 KB Blackwell limit)
-- **Allocation Details (for optimal config BLOCK_M = 64, BLOCK_N = 64, BLOCK_K = 32, ab_stage = 3, SPLIT_K = 8):**
-  - `sX` (BFloat16, 3 stages): `BLOCK_M * BLOCK_K_STAGE * 3` = `64 * 32 * 3 = 6,144` elements (**12.288 KB**).
-  - `sW` (BFloat16, 3 stages): `BLOCK_N * BLOCK_K_STAGE * 3` = `64 * 32 * 3 = 6,144` elements (**12.288 KB**).
-  - `smem_accum` (Float32, epilogue buffer): `BLOCK_M * BLOCK_N_padded` = `64 * 72 = 4,608` elements (**18.432 KB**).
-  - Peak SMEM utilization is exactly **24.576 KB** (reusing mainloop memory chunks via aliasing).
+- **Total Active Shared Memory:** **~49.2 KB** (within 99 KB Blackwell limit)
+- **Allocation Details (for optimal config BLOCK_M = 64, BLOCK_N = 128, BLOCK_K = 32, ab_stage = 4, SPLIT_K = 8):**
+  - `sX` (BFloat16, 4 stages): `BLOCK_M * BLOCK_K_STAGE * 4` = `64 * 32 * 4 = 8,192` elements (**16.384 KB**).
+  - `sW` (BFloat16, 4 stages): `BLOCK_N * BLOCK_K_STAGE * 4` = `128 * 32 * 4 = 16,384` elements (**32.768 KB**).
+  - `smem_accum` (Float32, epilogue buffer): `BLOCK_M * BLOCK_N_padded` = `64 * 136 = 8,704` elements (**34.816 KB**).
+  - Peak SMEM utilization is exactly **49.152 KB** (since epilogue memory is aliased with mainloop staged buffers).
 
 ### 10. Thread Block Clusters for L2 Cache Saturation
 - **Cluster Shape:** `cluster=[2, 1, 1]`
