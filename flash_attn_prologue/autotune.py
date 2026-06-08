@@ -71,43 +71,31 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
     elif mode in ("bwd_dx", "bwd_dw"):
         candidates = []
         if mode == "bwd_dx":
-            # Test different BLOCK_K and stage options for dx (M=128, N=128)
-            for bk in [32, 64]:
-                for stage in [2, 3]:
-                    sX_bytes = stage * 128 * bk * 2
-                    sW_bytes = stage * 128 * bk * 2
-                    mainloop_bytes = sX_bytes + sW_bytes
-                    epilogue_bytes = 128 * 136 * 4
-                    smem_bytes = max(mainloop_bytes, epilogue_bytes)
-                    if smem_bytes <= 99 * 1024:
-                        candidates.append({
-                            "BLOCK_M": 128,
-                            "BLOCK_N": 128,
-                            "BLOCK_K": bk,
-                            "ab_stage": stage,
-                            "num_warps": 4,
-                            "maxrregcount": 255
-                        })
+            # dx requires 128x128 and ab_stage = 3 to avoid Write-After-Read race conditions / NaNs
+            candidates.append({
+                "BLOCK_M": 128,
+                "BLOCK_N": 128,
+                "BLOCK_K": 32,
+                "ab_stage": 3,
+                "num_warps": 4,
+                "maxrregcount": 255
+            })
         else: # bwd_dw
             # Support symmetric block sizes 64x64 with 2 or 3 stages (BLOCK_M must be 64 for TMA head dimension contiguity)
             for block_size in [64]:
-                for bk in [32, 64]:
+                for bk in [32]:
                     for stage in [2, 3]:
                         for regs in [255]:
                             for split_k in [1, 2, 4, 8, 16, 32]:
-                                mainloop_bytes = stage * block_size * bk * 2 + stage * block_size * bk * 2
-                                epilogue_bytes = block_size * (block_size + 8) * 4
-                                smem_bytes = max(mainloop_bytes, epilogue_bytes)
-                                if smem_bytes <= 99 * 1024:
-                                    candidates.append({
-                                        "BLOCK_M": block_size,
-                                        "BLOCK_N": block_size,
-                                        "BLOCK_K": bk,
-                                        "ab_stage": stage,
-                                        "num_warps": 4,
-                                        "maxrregcount": regs,
-                                        "SPLIT_K": split_k
-                                    })
+                                candidates.append({
+                                    "BLOCK_M": block_size,
+                                    "BLOCK_N": block_size,
+                                    "BLOCK_K": bk,
+                                    "ab_stage": stage,
+                                    "num_warps": 4,
+                                    "maxrregcount": regs,
+                                    "SPLIT_K": split_k
+                                })
     elif mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
         candidates = []
         for hg in [1, 2, 4, 8]:
@@ -496,10 +484,7 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                 grad_k_prof = torch.randn(B_prof, 16, N_seq_prof, 64, device=device, dtype=torch.bfloat16)
                 grad_v_prof = torch.randn(B_prof, 16, N_seq_prof, 64, device=device, dtype=torch.bfloat16)
                 x_prof = torch.randn(prof_K, prof_N, device=device, dtype=torch.bfloat16)
-                if split_k > 1:
-                    grad_weight_prof = torch.empty(split_k, prof_M, prof_N, device=device, dtype=torch.float32)
-                else:
-                    grad_weight_prof = torch.empty(prof_M, prof_N, device=device, dtype=torch.float32)
+                grad_weight_prof = torch.zeros((split_k * prof_M, prof_N), device=device, dtype=torch.float32)
                 
                 dw_kernel = get_matmul_bwd_dw_kernel(
                     num_warps=warps,
@@ -516,20 +501,18 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                     k_strides=grad_k_prof.stride(),
                     v_strides=grad_v_prof.stride(),
                     maxrregcount=regs,
-                    SPLIT_K=split_k
+                    SPLIT_K=config.get("SPLIT_K", 1)
                 )
                 
-                grad_weight_prof_passed = grad_weight_prof.view(split_k * prof_M, prof_N) if split_k > 1 else grad_weight_prof
-                
                 for _ in range(3):
-                    dw_kernel(grad_q_prof, grad_k_prof, grad_v_prof, x_prof, grad_weight_prof_passed)
+                    dw_kernel(grad_q_prof, grad_k_prof, grad_v_prof, x_prof, grad_weight_prof)
                 torch.cuda.synchronize()
                 
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
                 start_event.record()
                 for _ in range(15):
-                    dw_kernel(grad_q_prof, grad_k_prof, grad_v_prof, x_prof, grad_weight_prof_passed)
+                    dw_kernel(grad_q_prof, grad_k_prof, grad_v_prof, x_prof, grad_weight_prof)
                 end_event.record()
                 torch.cuda.synchronize()
                 curr_ms = start_event.elapsed_time(end_event) / 15.0
