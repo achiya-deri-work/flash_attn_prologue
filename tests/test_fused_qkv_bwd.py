@@ -117,6 +117,9 @@ def test_cute_fused_qkv_fwd_bwd_parity_and_benchmark():
             _ = compiled_fn(x_tensor)
         torch.cuda.synchronize()
         
+        torch.cuda.reset_peak_memory_stats()
+        mem_base = torch.cuda.memory_allocated()
+        
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         
@@ -127,8 +130,9 @@ def test_cute_fused_qkv_fwd_bwd_parity_and_benchmark():
         torch.cuda.synchronize()
         
         avg_ms = start_event.elapsed_time(end_event) / 100.0
-        print(f"[{label}] Forward Avg Time: {avg_ms:.4f} ms")
-        return avg_ms
+        peak_vram = (torch.cuda.max_memory_allocated() - mem_base) / (1024**2)
+        print(f"[{label}] Forward Avg Time: {avg_ms:.4f} ms | Peak VRAM: {peak_vram:.2f} MB")
+        return avg_ms, peak_vram
 
     # Measure Forward + Backward
     def benchmark_fwd_bwd(compiled_fn, x_tensor, weight_tensor, label):
@@ -141,6 +145,9 @@ def test_cute_fused_qkv_fwd_bwd_parity_and_benchmark():
             weight_tensor.grad.zero_()
         torch.cuda.synchronize()
         
+        torch.cuda.reset_peak_memory_stats()
+        mem_base = torch.cuda.memory_allocated()
+        
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         
@@ -155,15 +162,16 @@ def test_cute_fused_qkv_fwd_bwd_parity_and_benchmark():
         torch.cuda.synchronize()
         
         avg_ms = start_event.elapsed_time(end_event) / 100.0
-        print(f"[{label}] Fwd+Bwd Avg Time: {avg_ms:.4f} ms")
-        return avg_ms
+        peak_vram = (torch.cuda.max_memory_allocated() - mem_base) / (1024**2)
+        print(f"[{label}] Fwd+Bwd Avg Time: {avg_ms:.4f} ms | Peak VRAM: {peak_vram:.2f} MB")
+        return avg_ms, peak_vram
 
     print("\n--- Running Latency Benchmarks (100 iterations) ---")
-    fwd_torch = benchmark_fwd(compiled_torch, x_t, "Torch Compiled (Inductor)")
-    fwd_cute = benchmark_fwd(compiled_cute, x_c, "CuTe Fused QKV")
+    fwd_torch, fwd_torch_mem = benchmark_fwd(compiled_torch, x_t, "Torch Compiled (Inductor)")
+    fwd_cute, fwd_cute_mem = benchmark_fwd(compiled_cute, x_c, "CuTe Fused QKV")
     
-    fwd_bwd_torch = benchmark_fwd_bwd(compiled_torch, x_t, torch_model.qkv_proj.weight, "Torch Compiled (Inductor)")
-    fwd_bwd_cute = benchmark_fwd_bwd(compiled_cute, x_c, cute_model.qkv_proj.weight, "CuTe Fused QKV")
+    fwd_bwd_torch, fwd_bwd_torch_mem = benchmark_fwd_bwd(compiled_torch, x_t, torch_model.qkv_proj.weight, "Torch Compiled (Inductor)")
+    fwd_bwd_cute, fwd_bwd_cute_mem = benchmark_fwd_bwd(compiled_cute, x_c, cute_model.qkv_proj.weight, "CuTe Fused QKV")
     
     # Calculate backward and overhead by subtraction
     bwd_torch = fwd_bwd_torch - fwd_torch
@@ -173,8 +181,10 @@ def test_cute_fused_qkv_fwd_bwd_parity_and_benchmark():
     print("[Benchmark Breakdown Summary]")
     print("=======================================================")
     print(f"Forward Latency:      Torch = {fwd_torch:.4f} ms | CuTe = {fwd_cute:.4f} ms  --> Speedup: {fwd_torch / fwd_cute:.2f}x")
+    print(f"Forward Peak VRAM:    Torch = {fwd_torch_mem:.2f} MB | CuTe = {fwd_cute_mem:.2f} MB")
     print(f"Backward+Overhead:    Torch = {bwd_torch:.4f} ms | CuTe = {bwd_cute:.4f} ms  --> Speedup: {bwd_torch / bwd_cute:.2f}x")
     print(f"Total Fwd+Bwd Latency: Torch = {fwd_bwd_torch:.4f} ms | CuTe = {fwd_bwd_cute:.4f} ms  --> Speedup: {fwd_bwd_torch / fwd_bwd_cute:.2f}x")
+    print(f"Total Fwd+Bwd VRAM:   Torch = {fwd_bwd_torch_mem:.2f} MB | CuTe = {fwd_bwd_cute_mem:.2f} MB")
     print("=======================================================")
 
 if __name__ == '__main__':
