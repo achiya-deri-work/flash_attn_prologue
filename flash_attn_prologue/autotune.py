@@ -46,7 +46,7 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
             {"HEAD_GROUP": 8, "BLOCK_M": 16, "BLOCK_N": 1536, "BLOCK_K": 16},
             {"HEAD_GROUP": 8, "BLOCK_M": 16, "BLOCK_N": 1536, "BLOCK_K": 8},
         ]
-    elif mode == "overlap":
+    elif mode == "fused_qkv":
         candidates = []
         for hg in [1, 2]:
             for bm in [32, 64]:
@@ -176,7 +176,7 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                 candidates.append({"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk})
             
     if not candidates:
-        if mode == "overlap":
+        if mode == "fused_qkv":
             return {"HEAD_GROUP": 1, "BLOCK_M": 64, "BLOCK_K": 16, "ab_stage": 3, "num_warps": 4, "maxrregcount": 255}
         elif mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
             return {"HEAD_GROUP": 2, "BLOCK_M": 64, "ab_stage": 1, "num_warps": 4, "maxrregcount": 255}
@@ -267,8 +267,8 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                 end_event.record()
                 torch.cuda.synchronize()
                 curr_ms = start_event.elapsed_time(end_event) / 15.0
-            elif mode == "overlap":
-                from flash_attn_prologue.fused_qkv_overlap import get_fused_qkv_overlap_kernel
+            elif mode == "fused_qkv":
+                from flash_attn_prologue.fused_qkv import get_fused_qkv_kernel
                 
                 hg = config["HEAD_GROUP"]
                 stage = config["ab_stage"]
@@ -283,7 +283,7 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                 head_dim = 64
                 hidden = K
                 
-                fwd_kernel = get_fused_qkv_overlap_kernel(
+                fwd_kernel = get_fused_qkv_kernel(
                     num_warps=warps,
                     BLOCK_M=bm,
                     BLOCK_K_STAGE=bk,
@@ -535,7 +535,7 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
             continue
             
     if best_config is None:
-        if mode == "overlap":
+        if mode == "fused_qkv":
             best_config = {"HEAD_GROUP": 1, "BLOCK_M": 64, "BLOCK_K": 16, "ab_stage": 3, "num_warps": 4, "maxrregcount": 255}
         elif mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
             best_config = {"HEAD_GROUP": 2, "BLOCK_M": 64, "ab_stage": 1, "num_warps": 4, "maxrregcount": 255}

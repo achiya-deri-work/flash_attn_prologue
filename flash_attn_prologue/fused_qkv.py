@@ -14,7 +14,7 @@ from cutlass.cute.nvgpu import cpasync
 from quack.compile_utils import make_fake_tensor
 from quack import copy_utils
 
-class FusedQKVOverlap:
+class FusedQKV:
     def __init__(self, num_warps: int = 4, BLOCK_M: int = 64, BLOCK_K_STAGE: int = 32, NUM_HEADS: int = 16, HEAD_DIM: int = 64, HEAD_GROUP: int = 2, hidden: int = 512, use_sync_in_loop: bool = True, ab_stage: int = None):
         self.num_warps = num_warps  # 4 warps (128 threads)
         self.BLOCK_M = BLOCK_M
@@ -501,15 +501,15 @@ class FusedQKVOverlap:
                                 k_g[j] = k_s[j]
                                 v_g[j] = v_s[j]
 
-_overlap_compile_cache = {}
+_fused_qkv_compile_cache = {}
 
-def get_fused_qkv_overlap_kernel(num_warps=4, BLOCK_M=64, BLOCK_K_STAGE=32, NUM_HEADS=16, HEAD_DIM=64, HEAD_GROUP=2, hidden=512, use_sync_in_loop=True, ab_stage=None, maxrregcount=255):
+def get_fused_qkv_kernel(num_warps=4, BLOCK_M=64, BLOCK_K_STAGE=32, NUM_HEADS=16, HEAD_DIM=64, HEAD_GROUP=2, hidden=512, use_sync_in_loop=True, ab_stage=None, maxrregcount=255):
     key = (num_warps, BLOCK_M, BLOCK_K_STAGE, NUM_HEADS, HEAD_DIM, HEAD_GROUP, hidden, use_sync_in_loop, ab_stage, maxrregcount)
-    if key not in _overlap_compile_cache:
+    if key not in _fused_qkv_compile_cache:
         B_sym = cute.sym_int()
         N_sym = cute.sym_int()
         
-        fwd_op = FusedQKVOverlap(
+        fwd_op = FusedQKV(
             num_warps=num_warps,
             BLOCK_M=BLOCK_M,
             BLOCK_K_STAGE=BLOCK_K_STAGE,
@@ -539,11 +539,11 @@ def get_fused_qkv_overlap_kernel(num_warps=4, BLOCK_M=64, BLOCK_K_STAGE=32, NUM_
             fake_stream,
             options=f"--enable-tvm-ffi --opt-level 3 --ptxas-options '-O3 -v --maxrregcount={maxrregcount}'",
         )
-        _overlap_compile_cache[key] = compiled_fwd
-    return _overlap_compile_cache[key]
+        _fused_qkv_compile_cache[key] = compiled_fwd
+    return _fused_qkv_compile_cache[key]
  
-@torch.library.custom_op("flash_prologue::fused_qkv_overlap", mutates_args=())
-def fused_qkv_overlap_op(
+@torch.library.custom_op("flash_prologue::fused_qkv", mutates_args=())
+def fused_qkv_op(
     x: torch.Tensor,
     weight: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -553,7 +553,7 @@ def fused_qkv_overlap_op(
     
     # Query Autotuner for optimal shape configs
     from flash_attn_prologue.autotune import get_autotuned_config
-    config = get_autotuned_config(B * N, 3 * num_heads * head_dim, hidden, "overlap", device=str(x.device))
+    config = get_autotuned_config(B * N, 3 * num_heads * head_dim, hidden, "fused_qkv", device=str(x.device))
     
     block_m = config["BLOCK_M"]
     block_k = config["BLOCK_K"]
@@ -566,7 +566,7 @@ def fused_qkv_overlap_op(
     k_proj_bf16 = torch.empty((B, num_heads, N, head_dim), dtype=torch.bfloat16, device=x.device)
     v_proj_bf16 = torch.empty((B, num_heads, N, head_dim), dtype=torch.bfloat16, device=x.device)
     
-    fwd_kernel = get_fused_qkv_overlap_kernel(
+    fwd_kernel = get_fused_qkv_kernel(
         num_warps=num_warps,
         BLOCK_M=block_m,
         BLOCK_K_STAGE=block_k,
@@ -591,8 +591,8 @@ def fused_qkv_overlap_op(
     
     return q_proj_bf16, k_proj_bf16, v_proj_bf16
 
-@fused_qkv_overlap_op.register_fake
-def _fused_qkv_overlap_fake(x, weight):
+@fused_qkv_op.register_fake
+def _fused_qkv_fake(x, weight):
     B, N, hidden = x.shape
     num_heads = weight.shape[0] // 3 // 64
     head_dim = 64

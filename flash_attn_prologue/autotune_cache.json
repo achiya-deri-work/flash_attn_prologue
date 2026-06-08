@@ -61,7 +61,7 @@
         "num_warps": 8,
         "maxrregcount": 255
     },
-    "16384_3072_512_overlap": {
+    "16384_3072_512_fused_qkv": {
         "HEAD_GROUP": 2,
         "BLOCK_M": 64,
         "BLOCK_K": 16,

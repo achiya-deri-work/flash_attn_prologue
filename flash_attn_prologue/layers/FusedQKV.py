@@ -14,7 +14,7 @@ def rotate_half_backward(x_tensor):
     x2 = x_tensor[..., x_tensor.shape[-1] // 2 :]
     return torch.cat((x2, -x1), dim=-1)
 
-@torch.library.custom_op("flash_prologue::fused_qkv", mutates_args=())
+@torch.library.custom_op("flash_prologue::fused_qkv_reference", mutates_args=())
 def fused_qkv_op(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -151,7 +151,7 @@ def fused_qkv_backward_hook(ctx, grad_q, grad_k, grad_v, grad_q_rsqrt, grad_k_rs
     return grad_x, grad_w, grad_norm, grad_scales, None, None, None, None, None
 
 torch.library.register_autograd(
-    "flash_prologue::fused_qkv",
+    "flash_prologue::fused_qkv_reference",
     fused_qkv_backward_hook,
     setup_context=setup_fused_qkv_context
 )

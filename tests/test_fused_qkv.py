@@ -1,5 +1,5 @@
 import torch
-import flash_attn_prologue.fused_qkv_overlap
+import flash_attn_prologue.fused_qkv
 import time
 
 class PureGemmBaselineModel(torch.nn.Module):
@@ -20,19 +20,19 @@ class PureGemmBaselineModel(torch.nn.Module):
         v = qkv[..., 2, :, :].permute(0, 2, 1, 3).contiguous()
         return q, k, v
 
-class FusedQKVOverlapModel(torch.nn.Module):
+class FusedQKVModel(torch.nn.Module):
     def __init__(self, hidden_size: int, num_heads: int, head_dim: int):
         super().__init__()
         self.qkv_proj = torch.nn.Linear(hidden_size, 3 * num_heads * head_dim, bias=False)
         self.qkv_proj.weight.requires_grad = False
         
     def forward(self, x):
-        q, k, v = torch.ops.flash_prologue.fused_qkv_overlap(
+        q, k, v = torch.ops.flash_prologue.fused_qkv(
             x, self.qkv_proj.weight
         )
         return q, k, v
 
-def test_cute_overlap_forward_parity_and_benchmark():
+def test_cute_fused_qkv_forward_parity_and_benchmark():
     B = 32
     N = 512
     hidden = 512
@@ -47,7 +47,7 @@ def test_cute_overlap_forward_parity_and_benchmark():
     x = torch.randn(B, N, hidden, device=device, dtype=dtype)
     
     layer_baseline = PureGemmBaselineModel(hidden, num_heads, head_dim).to(device=device, dtype=dtype)
-    layer_cute = FusedQKVOverlapModel(hidden, num_heads, head_dim).to(device=device, dtype=dtype)
+    layer_cute = FusedQKVModel(hidden, num_heads, head_dim).to(device=device, dtype=dtype)
     
     # Sync weights
     layer_cute.qkv_proj.weight.data.copy_(layer_baseline.qkv_proj.weight.data)
@@ -58,7 +58,7 @@ def test_cute_overlap_forward_parity_and_benchmark():
         _ = compiled_baseline(x)
         torch.cuda.synchronize()
         
-        print("\n--- Testing CuTe DSL Overlap Kernel ---")
+        print("\n--- Testing CuTe DSL Fused QKV Kernel ---")
         compiled_cute = torch.compile(layer_cute, backend="inductor")
         _ = compiled_cute(x)
         torch.cuda.synchronize()
@@ -93,7 +93,7 @@ def test_cute_overlap_forward_parity_and_benchmark():
 
     # Run benchmarks
     torch_time = run_benchmark(compiled_baseline, (x,), "Native Torch Compiled (Pure GEMM)")
-    cute_time = run_benchmark(compiled_cute, (x,), "CuTe DSL Overlap Kernel")
+    cute_time = run_benchmark(compiled_cute, (x,), "CuTe DSL Fused QKV Kernel")
     
     print("\n[Comparison Summary]")
     print(f"Speedup Factor: {torch_time / cute_time:.2f}x")
@@ -341,7 +341,7 @@ def test_cute_fused_epilogue_parity_and_benchmark():
         print(f"--- Detailed Numerical Accuracy (CuTe vs Triton) for {label} ---")
         print(f"Max Absolute Difference: {max_abs:.6f}")
         print(f"Mean Absolute Difference: {mean_abs:.6f}")
-
+ 
     def print_torch_comp_accuracy_metrics(c_tensor, tc_tensor, label):
         diff = (c_tensor.float() - tc_tensor.float()).abs()
         max_abs = diff.max().item()
@@ -389,5 +389,5 @@ def test_cute_fused_epilogue_parity_and_benchmark():
     print("\nAll Forward and Backward Parity Assertions Passed!")
 
 if __name__ == '__main__':
-    test_cute_overlap_forward_parity_and_benchmark()
+    test_cute_fused_qkv_forward_parity_and_benchmark()
     test_cute_fused_epilogue_parity_and_benchmark()

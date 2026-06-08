@@ -31,10 +31,10 @@ The project is structured as a modular Python library with clear separation betw
    - Parameterized to support overrides for pipeline stages (`ab_stage`), MMA warp layout (`atom_layout_mnk`), and register allocation (`num_regs_mma`, `num_regs_load`).
 8. **Eager Baselines (`flash_attn_prologue/layers/FusedQKV.py`):**
    - Pure PyTorch eager equivalents of the operations used for parity checking.
-9. **Fused QKV Overlap Kernel (`flash_attn_prologue/fused_qkv_overlap.py`):**
-   - Implements a resource-optimized fused GEMM projection kernel with parameterized pipeline stages (`ab_stage = 2` or `3`).
+9. **Fused QKV Kernel (`flash_attn_prologue/fused_qkv.py`):**
+   - Implements a resource-optimized fused QKV GEMM projection kernel with parameterized pipeline stages (`ab_stage = 2` or `3`).
    - Grid searched to find the optimal memory and register configuration.
-   - Registers under `flash_prologue::fused_qkv_overlap` with PyTorch.
+   - Registers under `flash_prologue::fused_qkv` with PyTorch.
 10. **In-Place Split-QK Standalone Fused Epilogue (`flash_attn_prologue/fused_epilogue.py`):**
     - Implements a layout-agnostic, standalone high-performance fused epilogue kernel that processes separate input tensors Q and K of shape `[B, H, N, D]`.
     - Specialized on input strides at JIT compile time, allowing it to execute directly on permuted non-contiguous view slices at zero runtime cost without PyTorch contiguous conversions.
@@ -151,7 +151,7 @@ graph TD
     FinalSync --> StoreSmem["Downcast & Element-wise Store: accum to sC_epi (aliased to sX)"]
     StoreSmem --> EpilogueSync["sync_threads()"]
     EpilogueSync --> Store["Direct Coalesced Vector Writes to GMEM"]
-### 6. Fused QKV Overlap Epilogue Pipeline (Pure GEMM Writeback)
+### 6. Fused QKV Epilogue Pipeline (Pure GEMM Writeback)
 ```mermaid
 graph TD
     Accum["GEMM Accumulators (q_reg, k_reg, v_reg in RMEM)"] --> Sync1["sync_threads() after accum write to smem_accum"]
@@ -253,7 +253,7 @@ graph TD
   - `sW` (BFloat16, 2-stage staged layout): `BLOCK_N * BLOCK_K * 2` = `128 * 64 * 2 = 16,384` elements (**32 KB**).
   - `sC_epi` (BFloat16, epilogue buffer): Aliased directly to `sX` memory location using pointer casting, reusing the first 32 KB of the memory chunk. (**0 KB** extra overhead).
 
-### 5. Fused QKV Overlap Kernel Map
+### 5. Fused QKV Kernel Map
 - **Total Active Shared Memory:** **98 KB** (fits under the 99 KB limit) for the optimal config `HEAD_GROUP = 2, BLOCK_M = 64, BLOCK_K = 16, ab_stage = 3`.
 - **Allocation Details:**
   - `sX` (BFloat16, 3 stages): `BLOCK_M * BLOCK_K * 3` = `64 * 16 * 3 = 3,072` elements (**6 KB**).
