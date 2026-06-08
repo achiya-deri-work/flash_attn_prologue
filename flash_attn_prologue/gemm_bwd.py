@@ -185,6 +185,7 @@ class GemmBwdDxCute:
         ).launch(
             grid=[swizzled_grid_x, cute.ceil_div(self.N_dim, self.BLOCK_N), 1],
             block=[num_threads, 1, 1],
+            cluster=[2, 1, 1],
             stream=stream
         )
 
@@ -671,6 +672,7 @@ class GemmBwdDwCute:
         ).launch(
             grid=[swizzled_grid_x, cute.ceil_div(self.N_dim, self.BLOCK_N), self.SPLIT_K],
             block=[num_threads, 1, 1],
+            cluster=[2, 1, 1],
             stream=stream
         )
 

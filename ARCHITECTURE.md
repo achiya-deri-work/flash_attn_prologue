@@ -292,4 +292,10 @@ graph TD
   - `smem_accum` (Float32, epilogue buffer): `BLOCK_M * BLOCK_N_padded` = `64 * 72 = 4,608` elements (**18.432 KB**).
   - Peak SMEM utilization is exactly **24.576 KB** (reusing mainloop memory chunks via aliasing).
 
+### 10. Thread Block Clusters for L2 Cache Saturation
+- **Cluster Shape:** `cluster=[2, 1, 1]`
+- **Blackwell Workaround:** On GeForce Blackwell (SM120), hardware TMA multicast is not supported. To work around this, we launch both [matmul_bwd_dx](file:///home/achiya/vs_code_main/flash_attn_prologue/flash_attn_prologue/gemm_bwd.py) and [matmul_bwd_dw](file:///home/achiya/vs_code_main/flash_attn_prologue/flash_attn_prologue/gemm_bwd.py) using a Thread Block Cluster of size 2 along the X grid dimension.
+- **Scheduling and Memory Flow:** The cluster configuration instructs the GPU scheduler to map sibling CTAs onto physically adjacent SMs. When the first CTA issues a standard TMA load to bring a tile of `weight` (for `bwd_dx`) or `x_flat` (for `bwd_dw`) from global memory, the tile is cached in L2. Sibling CTAs requesting the same tile will hit the L2 cache instead of hitting global memory, effectively neutralizing the GMEM read bottleneck by up to a factor of 2x.
+
+
 
