@@ -240,3 +240,10 @@
       - **Forward Fused QKV**: Average execution time of **0.5907 ms** (1.34x speedup vs PyTorch Inductor baseline of **0.7902 ms**).
       - **Fused Epilogue Fwd+Bwd**: Average execution time of **1.7919 ms** (1.36x speedup vs PyTorch Inductor baseline of **2.4301 ms** and 1.26x speedup vs Triton's **2.2600 ms**).
       - **Backward Standalone GEMM**: Standalone `matmul_bwd_dx` runs in **0.6151 ms** (vs eager baseline **0.4984 ms**) and standalone `matmul_bwd_dw` runs in **0.7740 ms** (vs eager baseline **0.5090 ms**).
+
+43. **Combined Fused QKV + Epilogue Operator (June 2026):**
+    - **Overview**: Implemented a combined custom operator `flash_prologue::fused_qkv_epilogue` that chains the QKV projection and standalone epilogue into a single autograd FFI node.
+    - **In-Place Mutation**: The operator runs the epilogue `fwd_kernel` directly in-place on the output projection buffers (`q_proj_bf16` and `k_proj_bf16`) allocated during the GEMM phase. This completely eliminates redundant intermediate output tensor allocations and global memory copies.
+    - **Autograd Compatibility**: During the forward pass, the operator clones the pre-epilogue projection tensors and returns them as hidden outputs 4 and 5. This allows PyTorch's `setup_context` to safely save the pre-epilogue states for the backward pass (enabling on-the-fly recomputation in the epilogue backward kernel), while keeping the user-facing Python API simple (returning only `q_final, k_final, v_proj`).
+    - **Verification**: Verified 100% numerical correctness parity and full compatibility under `torch.compile` (with CUDA Graphs graph capture) via `tests/test_fused_qkv_epilogue.py`.
+
