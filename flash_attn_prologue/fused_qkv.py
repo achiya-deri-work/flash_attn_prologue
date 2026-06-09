@@ -19,6 +19,22 @@ from cutlass.cute.nvgpu import cpasync
 from quack.compile_utils import make_fake_tensor
 from quack import copy_utils
 from flash_attn_prologue.autotune import get_autotuned_config
+from flash_attn_prologue.fused_epilogue import (
+    get_fused_epilogue_kernel,
+    get_fused_epilogue_back_kernel,
+    _epilogue_fwd_kernel_cache,
+    _epilogue_bwd_kernel_cache
+)
+from flash_attn_prologue.gemm_bwd import (
+    get_matmul_bwd_dx_kernel,
+    get_matmul_bwd_dw_kernel,
+    get_reduction_kernel,
+    get_workspace_tensor,
+    _bwd_dx_kernel_cache,
+    _bwd_dw_kernel_cache
+)
+
+
 
 class FusedQKV:
     def __init__(self, num_warps: int = 4, BLOCK_M: int = 64, BLOCK_K_STAGE: int = 32, NUM_HEADS: int = 16, HEAD_DIM: int = 64, HEAD_GROUP: int = 2, hidden: int = 512, use_sync_in_loop: bool = True, ab_stage: int = None, swizzle_x: int = 8, atom_layout_mnk = None):
@@ -669,21 +685,69 @@ def fused_qkv_epilogue_op(
     sin: torch.Tensor,
     cos: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    # 1. Project QKV
-    q_proj_bf16, k_proj_bf16, v_proj_bf16 = fused_qkv_op(x, weight)
+    x = _ensure_contiguous(x)
+    weight = _ensure_contiguous(weight)
     
-    # 2. Clone Q and K before mutation so they are preserved for the backward pass
-    q_proj_saved = q_proj_bf16.clone()
-    k_proj_saved = k_proj_bf16.clone()
+    B = int(x.shape[0])
+    N = int(x.shape[1])
+    hidden = int(x.shape[2])
+    num_heads = int(weight.shape[0] // 3 // 64)
+    head_dim = 64
     
-    # 3. Epilogue (in-place on q_proj_bf16 and k_proj_bf16)
-    from flash_attn_prologue.fused_epilogue import get_fused_epilogue_kernel, _epilogue_fwd_kernel_cache
+    # Pre-allocate all outputs at the start
+    q_proj_bf16 = torch.empty((B, num_heads, N, head_dim), dtype=torch.bfloat16, device=x.device)
+    k_proj_bf16 = torch.empty((B, num_heads, N, head_dim), dtype=torch.bfloat16, device=x.device)
+    v_proj_bf16 = torch.empty((B, num_heads, N, head_dim), dtype=torch.bfloat16, device=x.device)
     
-    B, num_heads, N, head_dim = q_proj_bf16.shape
+    q_final = torch.empty((B, num_heads, N, head_dim), dtype=torch.bfloat16, device=x.device)
+    k_final = torch.empty((B, num_heads, N, head_dim), dtype=torch.bfloat16, device=x.device)
     
+    # 1. Execute raw QKV forward kernel
     shape_key = (B, N)
-    fwd_kernel = _epilogue_fwd_kernel_cache.get(shape_key)
-    if fwd_kernel is None:
+    fwd_qkv_kernel = _fwd_kernel_cache.get(shape_key)
+    if fwd_qkv_kernel is None:
+        config = get_autotuned_config(B * N, 3 * num_heads * head_dim, hidden, "fused_qkv", device=str(x.device))
+        block_m = config["BLOCK_M"]
+        block_k = config["BLOCK_K"]
+        head_group = config.get("HEAD_GROUP", 2)
+        ab_stage = config.get("ab_stage", None)
+        num_warps = config.get("num_warps", 4)
+        maxrregcount = config.get("maxrregcount", 255)
+        swizzle_x = config.get("swizzle_x", 8)
+        
+        fwd_qkv_kernel = get_fused_qkv_kernel(
+            num_warps=num_warps,
+            BLOCK_M=block_m,
+            BLOCK_K_STAGE=block_k,
+            NUM_HEADS=num_heads,
+            HEAD_DIM=head_dim,
+            HEAD_GROUP=head_group,
+            hidden=hidden,
+            use_sync_in_loop=True,
+            ab_stage=ab_stage,
+            maxrregcount=maxrregcount,
+            swizzle_x=swizzle_x,
+            atom_layout_mnk=config.get("atom_layout_mnk", None)
+        )
+        _fwd_kernel_cache[shape_key] = fwd_qkv_kernel
+        
+    num_heads_x_dim = num_heads * head_dim
+    weight_q = weight[0 : num_heads_x_dim, :]
+    weight_k = weight[num_heads_x_dim : 2 * num_heads_x_dim, :]
+    weight_v = weight[2 * num_heads_x_dim : 3 * num_heads_x_dim, :]
+    
+    fwd_qkv_kernel(
+        x, weight_q, weight_k, weight_v,
+        q_proj_bf16, k_proj_bf16, v_proj_bf16
+    )
+    
+    # Copy projected Q and K to final outputs to leave pre-epilogue outputs untouched for backward
+    q_final.copy_(q_proj_bf16)
+    k_final.copy_(k_proj_bf16)
+    
+    # 2. Epilogue (in-place on q_final and k_final)
+    fwd_epi_kernel = _epilogue_fwd_kernel_cache.get(shape_key)
+    if fwd_epi_kernel is None:
         config = get_autotuned_config(M=N, N=num_heads, K=head_dim, is_fused="epilogue_fwd")
         BLOCK_M = config["BLOCK_M"]
         HEAD_GROUP = config["HEAD_GROUP"]
@@ -691,12 +755,12 @@ def fused_qkv_epilogue_op(
         num_warps = config.get("num_warps", 4)
         maxrregcount = config.get("maxrregcount", 255)
         
-        q_strides = q_proj_bf16.stride()
-        k_strides = k_proj_bf16.stride()
+        q_strides = q_final.stride()
+        k_strides = k_final.stride()
         sin_strides = sin.stride()
         cos_strides = cos.stride()
         
-        fwd_kernel = get_fused_epilogue_kernel(
+        fwd_epi_kernel = get_fused_epilogue_kernel(
             num_warps=num_warps,
             BLOCK_M=BLOCK_M,
             NUM_HEADS=num_heads,
@@ -709,18 +773,17 @@ def fused_qkv_epilogue_op(
             cos_strides=cos_strides,
             maxrregcount=maxrregcount
         )
-        _epilogue_fwd_kernel_cache[shape_key] = fwd_kernel
+        _epilogue_fwd_kernel_cache[shape_key] = fwd_epi_kernel
         
     rmsnorm_weight_32 = rmsnorm_weight if rmsnorm_weight.dtype == torch.float32 and rmsnorm_weight.is_contiguous() else rmsnorm_weight.to(torch.float32).contiguous()
     scales_32 = scales if scales.dtype == torch.float32 and scales.is_contiguous() else scales.to(torch.float32).contiguous()
     sin_32 = sin if sin.dtype == torch.float32 and sin.is_contiguous() else sin.to(torch.float32).contiguous()
     cos_32 = cos if cos.dtype == torch.float32 and cos.is_contiguous() else cos.to(torch.float32).contiguous()
     
-    # Execute epilogue in-place directly on the newly projected tensors
-    fwd_kernel(
-        q_proj_bf16, k_proj_bf16, rmsnorm_weight_32, scales_32, sin_32, cos_32
+    fwd_epi_kernel(
+        q_final, k_final, rmsnorm_weight_32, scales_32, sin_32, cos_32
     )
-    return q_proj_bf16, k_proj_bf16, v_proj_bf16, q_proj_saved, k_proj_saved
+    return q_final, k_final, v_proj_bf16, q_proj_bf16, k_proj_bf16
 
 @fused_qkv_epilogue_op.register_fake
 def _fused_qkv_epilogue_fake(x, weight, rmsnorm_weight, scales, sin, cos):
@@ -737,16 +800,145 @@ def _fused_qkv_epilogue_fake(x, weight, rmsnorm_weight, scales, sin, cos):
 def _fused_qkv_epilogue_backward(ctx, grad_q, grad_k, grad_v, grad_q_saved, grad_k_saved):
     x, weight, rmsnorm_weight, scales, sin, cos, q_proj_saved, k_proj_saved = ctx.saved_tensors
     
-    # 1. Epilogue Backward: propagate grad_q, grad_k to grad_q_before, grad_k_before using the saved pre-epilogue Q/K
-    dq_before, dk_before, grad_rmsnorm_weight, grad_scales = torch.ops.flash_prologue.qknorm_rope_scale_cute_backward(
-        q_proj_saved, k_proj_saved, rmsnorm_weight, scales, sin, cos, grad_q, grad_k
+    B = int(q_proj_saved.shape[0])
+    num_heads = int(q_proj_saved.shape[1])
+    N = int(q_proj_saved.shape[2])
+    head_dim = int(q_proj_saved.shape[3])
+    
+    # Pre-allocate epilogue backward outputs
+    dq_before = torch.empty_like(q_proj_saved)
+    dk_before = torch.empty_like(k_proj_saved)
+    grad_rmsnorm_weight = torch.zeros((2, 1, head_dim), device=q_proj_saved.device, dtype=torch.float32)
+    grad_scales = torch.zeros((num_heads, 1, 1), device=q_proj_saved.device, dtype=torch.float32)
+    
+    # 1. Execute raw epilogue backward kernel
+    shape_key = (B, N)
+    back_epi_kernel = _epilogue_bwd_kernel_cache.get(shape_key)
+    if back_epi_kernel is None:
+        config = get_autotuned_config(M=N, N=num_heads, K=head_dim, is_fused="epilogue_bwd")
+        BLOCK_M = config["BLOCK_M"]
+        HEAD_GROUP = config["HEAD_GROUP"]
+        ab_stage = config["ab_stage"]
+        num_warps = config.get("num_warps", 4)
+        maxrregcount = config.get("maxrregcount", 255)
+        
+        q_strides = q_proj_saved.stride()
+        k_strides = k_proj_saved.stride()
+        sin_strides = sin.stride()
+        cos_strides = cos.stride()
+        
+        back_epi_kernel = get_fused_epilogue_back_kernel(
+            num_warps=num_warps,
+            BLOCK_M=BLOCK_M,
+            NUM_HEADS=num_heads,
+            HEAD_DIM=head_dim,
+            HEAD_GROUP=HEAD_GROUP,
+            ab_stage=ab_stage,
+            q_strides=q_strides,
+            k_strides=k_strides,
+            sin_strides=sin_strides,
+            cos_strides=cos_strides,
+            maxrregcount=maxrregcount
+        )
+        _epilogue_bwd_kernel_cache[shape_key] = back_epi_kernel
+        
+    rmsnorm_weight_32 = rmsnorm_weight if rmsnorm_weight.dtype == torch.float32 and rmsnorm_weight.is_contiguous() else rmsnorm_weight.to(torch.float32).contiguous()
+    scales_32 = scales if scales.dtype == torch.float32 and scales.is_contiguous() else scales.to(torch.float32).contiguous()
+    sin_32 = sin if sin.dtype == torch.float32 and sin.is_contiguous() else sin.to(torch.float32).contiguous()
+    cos_32 = cos if cos.dtype == torch.float32 and cos.is_contiguous() else cos.to(torch.float32).contiguous()
+    
+    back_epi_kernel(
+        q_proj_saved, k_proj_saved, rmsnorm_weight_32, scales_32, sin_32, cos_32,
+        grad_q, grad_k, dq_before, dk_before,
+        grad_rmsnorm_weight, grad_scales
     )
     
-    # 2. QKV Projection Backward
-    grad_x, grad_weight = torch.ops.flash_prologue.fused_qkv_backward(
-        dq_before, dk_before, grad_v, weight, x
-    )
+    # 2. Execute raw matmul_bwd_dx kernel
+    M_dim_dx = B * N
+    K_dim_dx = 3 * num_heads * head_dim
+    N_dim = int(weight.shape[1])
     
+    grad_x = torch.empty((B, N, N_dim), dtype=torch.bfloat16, device=grad_q.device)
+    
+    static_stride_h = N * head_dim
+    static_stride_n = head_dim
+    static_stride_d = 1
+    static_strides = (None, static_stride_h, static_stride_n, static_stride_d)
+    
+    dx_kernel = _bwd_dx_kernel_cache.get(shape_key)
+    if dx_kernel is None:
+        config_dx = get_autotuned_config(M_dim_dx, N_dim, K_dim_dx, "bwd_dx", device=str(grad_q.device))
+        
+        dx_kernel = get_matmul_bwd_dx_kernel(
+            num_warps=config_dx.get("num_warps", 4),
+            BLOCK_M=config_dx["BLOCK_M"],
+            BLOCK_N=config_dx["BLOCK_N"],
+            BLOCK_K_STAGE=config_dx["BLOCK_K"],
+            ab_stage=config_dx.get("ab_stage", 2),
+            B=B,
+            N=N,
+            K_dim=K_dim_dx,
+            N_dim=N_dim,
+            NUM_HEADS=num_heads,
+            HEAD_DIM=head_dim,
+            q_strides=static_strides,
+            k_strides=static_strides,
+            v_strides=static_strides,
+            maxrregcount=config_dx.get("maxrregcount", 255),
+            swizzle_x=config_dx.get("swizzle_x", 8)
+        )
+        _bwd_dx_kernel_cache[shape_key] = dx_kernel
+        
+    dx_kernel(dq_before, dk_before, grad_v, weight, grad_x.view(M_dim_dx, N_dim))
+    
+    # 3. Execute raw matmul_bwd_dw kernel
+    M_dim_dw = 3 * num_heads * head_dim
+    K_dim_dw = B * N
+    
+    shape_key_dw = (B, N, False)
+    cached_dw = _bwd_dw_kernel_cache.get(shape_key_dw)
+    if cached_dw is None:
+        config_dw = get_autotuned_config(M_dim_dw, N_dim, K_dim_dw, "bwd_dw", device=str(grad_q.device))
+        split_k = config_dw.get("SPLIT_K", 1)
+        
+        dw_kernel = get_matmul_bwd_dw_kernel(
+            num_warps=config_dw.get("num_warps", 4),
+            BLOCK_M=config_dw["BLOCK_M"],
+            BLOCK_N=config_dw["BLOCK_N"],
+            BLOCK_K_STAGE=config_dw["BLOCK_K"],
+            ab_stage=config_dw.get("ab_stage", 2),
+            B=B,
+            N=N,
+            M_dim=M_dim_dw,
+            K_dim=K_dim_dw,
+            N_dim=N_dim,
+            NUM_HEADS=num_heads,
+            HEAD_DIM=head_dim,
+            q_strides=static_strides,
+            k_strides=static_strides,
+            v_strides=static_strides,
+            maxrregcount=config_dw.get("maxrregcount", 255),
+            SPLIT_K=split_k,
+            swizzle_x=config_dw.get("swizzle_x", 8)
+        )
+        _bwd_dw_cache_val = (dw_kernel, split_k)
+        _bwd_dw_kernel_cache[shape_key_dw] = _bwd_dw_cache_val
+    else:
+        dw_kernel, split_k = cached_dw
+        
+    grad_weight = torch.empty((M_dim_dw, N_dim), dtype=torch.bfloat16, device=grad_q.device)
+    x_flat = x.view(K_dim_dw, N_dim)
+    
+    if split_k > 1:
+        workspace = get_workspace_tensor((split_k, M_dim_dw, N_dim), dtype=torch.float32, device=grad_q.device)
+        workspace_flat = workspace.view(split_k * M_dim_dw, N_dim)
+        dw_kernel(dq_before, dk_before, grad_v, x_flat, workspace_flat)
+        
+        reduction_kernel = get_reduction_kernel(M_dim_dw, N_dim, split_k)
+        reduction_kernel(workspace, grad_weight)
+    else:
+        dw_kernel(dq_before, dk_before, grad_v, x_flat, grad_weight)
+        
     return grad_x, grad_weight, grad_rmsnorm_weight, grad_scales, None, None
 
 def _fused_qkv_epilogue_setup_context(ctx, inputs, output):
@@ -759,5 +951,155 @@ torch.library.register_autograd(
     _fused_qkv_epilogue_backward,
     setup_context=_fused_qkv_epilogue_setup_context
 )
+
+@torch.library.custom_op("flash_prologue::fused_qkv_epilogue_ckp", mutates_args=())
+def fused_qkv_epilogue_ckp_op(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    rmsnorm_weight: torch.Tensor,
+    scales: torch.Tensor,
+    sin: torch.Tensor,
+    cos: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    x = _ensure_contiguous(x)
+    weight = _ensure_contiguous(weight)
+    
+    B = int(x.shape[0])
+    N = int(x.shape[1])
+    hidden = int(x.shape[2])
+    num_heads = int(weight.shape[0] // 3 // 64)
+    head_dim = 64
+    
+    # Pre-allocate all outputs at the start
+    q_proj_bf16 = torch.empty((B, num_heads, N, head_dim), dtype=torch.bfloat16, device=x.device)
+    k_proj_bf16 = torch.empty((B, num_heads, N, head_dim), dtype=torch.bfloat16, device=x.device)
+    v_proj_bf16 = torch.empty((B, num_heads, N, head_dim), dtype=torch.bfloat16, device=x.device)
+    
+    q_final = torch.empty((B, num_heads, N, head_dim), dtype=torch.bfloat16, device=x.device)
+    k_final = torch.empty((B, num_heads, N, head_dim), dtype=torch.bfloat16, device=x.device)
+    
+    # 1. Execute raw QKV forward kernel
+    shape_key = (B, N)
+    fwd_qkv_kernel = _fwd_kernel_cache.get(shape_key)
+    if fwd_qkv_kernel is None:
+        config = get_autotuned_config(B * N, 3 * num_heads * head_dim, hidden, "fused_qkv", device=str(x.device))
+        block_m = config["BLOCK_M"]
+        block_k = config["BLOCK_K"]
+        head_group = config.get("HEAD_GROUP", 2)
+        ab_stage = config.get("ab_stage", None)
+        num_warps = config.get("num_warps", 4)
+        maxrregcount = config.get("maxrregcount", 255)
+        swizzle_x = config.get("swizzle_x", 8)
+        
+        fwd_qkv_kernel = get_fused_qkv_kernel(
+            num_warps=num_warps,
+            BLOCK_M=block_m,
+            BLOCK_K_STAGE=block_k,
+            NUM_HEADS=num_heads,
+            HEAD_DIM=head_dim,
+            HEAD_GROUP=head_group,
+            hidden=hidden,
+            use_sync_in_loop=True,
+            ab_stage=ab_stage,
+            maxrregcount=maxrregcount,
+            swizzle_x=swizzle_x,
+            atom_layout_mnk=config.get("atom_layout_mnk", None)
+        )
+        _fwd_kernel_cache[shape_key] = fwd_qkv_kernel
+        
+    num_heads_x_dim = num_heads * head_dim
+    weight_q = weight[0 : num_heads_x_dim, :]
+    weight_k = weight[num_heads_x_dim : 2 * num_heads_x_dim, :]
+    weight_v = weight[2 * num_heads_x_dim : 3 * num_heads_x_dim, :]
+    
+    fwd_qkv_kernel(
+        x, weight_q, weight_k, weight_v,
+        q_proj_bf16, k_proj_bf16, v_proj_bf16
+    )
+    
+    # Copy projected Q and K to final outputs to leave pre-epilogue outputs untouched in forward (but not saved)
+    q_final.copy_(q_proj_bf16)
+    k_final.copy_(k_proj_bf16)
+    
+    # 2. Epilogue (in-place on q_final and k_final)
+    fwd_epi_kernel = _epilogue_fwd_kernel_cache.get(shape_key)
+    if fwd_epi_kernel is None:
+        config = get_autotuned_config(M=N, N=num_heads, K=head_dim, is_fused="epilogue_fwd")
+        BLOCK_M = config["BLOCK_M"]
+        HEAD_GROUP = config["HEAD_GROUP"]
+        ab_stage = config["ab_stage"]
+        num_warps = config.get("num_warps", 4)
+        maxrregcount = config.get("maxrregcount", 255)
+        
+        q_strides = q_final.stride()
+        k_strides = k_final.stride()
+        sin_strides = sin.stride()
+        cos_strides = cos.stride()
+        
+        fwd_epi_kernel = get_fused_epilogue_kernel(
+            num_warps=num_warps,
+            BLOCK_M=BLOCK_M,
+            NUM_HEADS=num_heads,
+            HEAD_DIM=head_dim,
+            HEAD_GROUP=HEAD_GROUP,
+            ab_stage=ab_stage,
+            q_strides=q_strides,
+            k_strides=k_strides,
+            sin_strides=sin_strides,
+            cos_strides=cos_strides,
+            maxrregcount=maxrregcount
+        )
+        _epilogue_fwd_kernel_cache[shape_key] = fwd_epi_kernel
+        
+    rmsnorm_weight_32 = rmsnorm_weight if rmsnorm_weight.dtype == torch.float32 and rmsnorm_weight.is_contiguous() else rmsnorm_weight.to(torch.float32).contiguous()
+    scales_32 = scales if scales.dtype == torch.float32 and scales.is_contiguous() else scales.to(torch.float32).contiguous()
+    sin_32 = sin if sin.dtype == torch.float32 and sin.is_contiguous() else sin.to(torch.float32).contiguous()
+    cos_32 = cos if cos.dtype == torch.float32 and cos.is_contiguous() else cos.to(torch.float32).contiguous()
+    
+    fwd_epi_kernel(
+        q_final, k_final, rmsnorm_weight_32, scales_32, sin_32, cos_32
+    )
+    return q_final, k_final, v_proj_bf16
+
+@fused_qkv_epilogue_ckp_op.register_fake
+def _fused_qkv_epilogue_ckp_fake(x, weight, rmsnorm_weight, scales, sin, cos):
+    B, N, hidden = x.shape
+    num_heads = weight.shape[0] // 3 // 64
+    head_dim = 64
+    q_proj = torch.empty((B, num_heads, N, head_dim), dtype=x.dtype, device=x.device)
+    k_proj = torch.empty((B, num_heads, N, head_dim), dtype=x.dtype, device=x.device)
+    v_proj = torch.empty((B, num_heads, N, head_dim), dtype=x.dtype, device=x.device)
+    return q_proj, k_proj, v_proj
+
+def _fused_qkv_epilogue_ckp_backward(ctx, grad_q, grad_k, grad_v):
+    x, weight, rmsnorm_weight, scales, sin, cos = ctx.saved_tensors
+    
+    # 1. Recompute Q and K projections from inputs
+    q_proj, k_proj, _ = torch.ops.flash_prologue.fused_qkv(x, weight)
+    
+    # 2. Run Epilogue Backward
+    dq_before, dk_before, grad_rmsnorm_weight, grad_scales = torch.ops.flash_prologue.qknorm_rope_scale_cute_backward(
+        q_proj, k_proj, rmsnorm_weight, scales, sin, cos, grad_q, grad_k
+    )
+    
+    # 3. Run QKV Projection Backward
+    grad_x, grad_weight = torch.ops.flash_prologue.fused_qkv_backward(
+        dq_before, dk_before, grad_v, weight, x
+    )
+    
+    return grad_x, grad_weight, grad_rmsnorm_weight, grad_scales, None, None
+
+
+def _fused_qkv_epilogue_ckp_setup_context(ctx, inputs, output):
+    x, weight, rmsnorm_weight, scales, sin, cos = inputs
+    # Save only the inputs! No outputs or intermediates saved!
+    ctx.save_for_backward(x, weight, rmsnorm_weight, scales, sin, cos)
+
+torch.library.register_autograd(
+    "flash_prologue::fused_qkv_epilogue_ckp",
+    _fused_qkv_epilogue_ckp_backward,
+    setup_context=_fused_qkv_epilogue_ckp_setup_context
+)
+
 
 
