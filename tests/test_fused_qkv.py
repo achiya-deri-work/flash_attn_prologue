@@ -162,7 +162,7 @@ def qknorm_rope_scale_torch_comp(qkv, rmsnorm_weight, scales, freqs, eps=1e-5):
 
 def test_cute_fused_epilogue_parity_and_benchmark():
     import flash_attn_prologue.fused_epilogue
-    from flash_attn_prologue.epilogue_kernel import qknorm_rope_scale_eager
+    from flash_attn_prologue.epilogue_kernel import qknorm_rope_scale_triton, qknorm_rope_scale_eager
     
     B = 32
     N = 512

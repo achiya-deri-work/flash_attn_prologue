@@ -659,3 +659,105 @@ torch.library.register_autograd(
     _fused_qkv_backward,
     setup_context=_fused_qkv_setup_context
 )
+
+@torch.library.custom_op("flash_prologue::fused_qkv_epilogue", mutates_args=())
+def fused_qkv_epilogue_op(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    rmsnorm_weight: torch.Tensor,
+    scales: torch.Tensor,
+    sin: torch.Tensor,
+    cos: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # 1. Project QKV
+    q_proj_bf16, k_proj_bf16, v_proj_bf16 = fused_qkv_op(x, weight)
+    
+    # 2. Clone Q and K before mutation so they are preserved for the backward pass
+    q_proj_saved = q_proj_bf16.clone()
+    k_proj_saved = k_proj_bf16.clone()
+    
+    # 3. Epilogue (in-place on q_proj_bf16 and k_proj_bf16)
+    from flash_attn_prologue.fused_epilogue import get_fused_epilogue_kernel, _epilogue_fwd_kernel_cache
+    
+    B, num_heads, N, head_dim = q_proj_bf16.shape
+    
+    shape_key = (B, N)
+    fwd_kernel = _epilogue_fwd_kernel_cache.get(shape_key)
+    if fwd_kernel is None:
+        config = get_autotuned_config(M=N, N=num_heads, K=head_dim, is_fused="epilogue_fwd")
+        BLOCK_M = config["BLOCK_M"]
+        HEAD_GROUP = config["HEAD_GROUP"]
+        ab_stage = config["ab_stage"]
+        num_warps = config.get("num_warps", 4)
+        maxrregcount = config.get("maxrregcount", 255)
+        
+        q_strides = q_proj_bf16.stride()
+        k_strides = k_proj_bf16.stride()
+        sin_strides = sin.stride()
+        cos_strides = cos.stride()
+        
+        fwd_kernel = get_fused_epilogue_kernel(
+            num_warps=num_warps,
+            BLOCK_M=BLOCK_M,
+            NUM_HEADS=num_heads,
+            HEAD_DIM=head_dim,
+            HEAD_GROUP=HEAD_GROUP,
+            ab_stage=ab_stage,
+            q_strides=q_strides,
+            k_strides=k_strides,
+            sin_strides=sin_strides,
+            cos_strides=cos_strides,
+            maxrregcount=maxrregcount
+        )
+        _epilogue_fwd_kernel_cache[shape_key] = fwd_kernel
+        
+    rmsnorm_weight_32 = rmsnorm_weight if rmsnorm_weight.dtype == torch.float32 and rmsnorm_weight.is_contiguous() else rmsnorm_weight.to(torch.float32).contiguous()
+    scales_32 = scales if scales.dtype == torch.float32 and scales.is_contiguous() else scales.to(torch.float32).contiguous()
+    sin_32 = sin if sin.dtype == torch.float32 and sin.is_contiguous() else sin.to(torch.float32).contiguous()
+    cos_32 = cos if cos.dtype == torch.float32 and cos.is_contiguous() else cos.to(torch.float32).contiguous()
+    
+    # Execute epilogue in-place directly on the newly projected tensors
+    fwd_kernel(
+        q_proj_bf16, k_proj_bf16, rmsnorm_weight_32, scales_32, sin_32, cos_32
+    )
+    return q_proj_bf16, k_proj_bf16, v_proj_bf16, q_proj_saved, k_proj_saved
+
+@fused_qkv_epilogue_op.register_fake
+def _fused_qkv_epilogue_fake(x, weight, rmsnorm_weight, scales, sin, cos):
+    B, N, hidden = x.shape
+    num_heads = weight.shape[0] // 3 // 64
+    head_dim = 64
+    q_proj = torch.empty((B, num_heads, N, head_dim), dtype=x.dtype, device=x.device)
+    k_proj = torch.empty((B, num_heads, N, head_dim), dtype=x.dtype, device=x.device)
+    v_proj = torch.empty((B, num_heads, N, head_dim), dtype=x.dtype, device=x.device)
+    q_proj_saved = torch.empty((B, num_heads, N, head_dim), dtype=x.dtype, device=x.device)
+    k_proj_saved = torch.empty((B, num_heads, N, head_dim), dtype=x.dtype, device=x.device)
+    return q_proj, k_proj, v_proj, q_proj_saved, k_proj_saved
+
+def _fused_qkv_epilogue_backward(ctx, grad_q, grad_k, grad_v, grad_q_saved, grad_k_saved):
+    x, weight, rmsnorm_weight, scales, sin, cos, q_proj_saved, k_proj_saved = ctx.saved_tensors
+    
+    # 1. Epilogue Backward: propagate grad_q, grad_k to grad_q_before, grad_k_before using the saved pre-epilogue Q/K
+    dq_before, dk_before, grad_rmsnorm_weight, grad_scales = torch.ops.flash_prologue.qknorm_rope_scale_cute_backward(
+        q_proj_saved, k_proj_saved, rmsnorm_weight, scales, sin, cos, grad_q, grad_k
+    )
+    
+    # 2. QKV Projection Backward
+    grad_x, grad_weight = torch.ops.flash_prologue.fused_qkv_backward(
+        dq_before, dk_before, grad_v, weight, x
+    )
+    
+    return grad_x, grad_weight, grad_rmsnorm_weight, grad_scales, None, None
+
+def _fused_qkv_epilogue_setup_context(ctx, inputs, output):
+    x, weight, rmsnorm_weight, scales, sin, cos = inputs
+    q_proj, k_proj, v_proj, q_proj_saved, k_proj_saved = output
+    ctx.save_for_backward(x, weight, rmsnorm_weight, scales, sin, cos, q_proj_saved, k_proj_saved)
+
+torch.library.register_autograd(
+    "flash_prologue::fused_qkv_epilogue",
+    _fused_qkv_epilogue_backward,
+    setup_context=_fused_qkv_epilogue_setup_context
+)
+
+
