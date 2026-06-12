@@ -1,0 +1,108 @@
+{
+    "64_16_2": {
+        "num_warps": 4,
+        "TILE_S": 4,
+        "buf_size": 1,
+        "layout_option": "multiple",
+        "maxrregcount": 255
+    },
+    "64_32_2": {
+        "num_warps": 4,
+        "TILE_S": 4,
+        "buf_size": 1,
+        "layout_option": "coprime",
+        "maxrregcount": 255
+    },
+    "64_64_2": {
+        "num_warps": 4,
+        "TILE_S": 1,
+        "buf_size": 1,
+        "layout_option": "multiple",
+        "maxrregcount": 255
+    },
+    "64_16_4": {
+        "num_warps": 4,
+        "TILE_S": 1,
+        "buf_size": 1,
+        "layout_option": "multiple",
+        "maxrregcount": 255
+    },
+    "64_32_4": {
+        "num_warps": 2,
+        "TILE_S": 1,
+        "buf_size": 1,
+        "layout_option": "multiple",
+        "maxrregcount": 192
+    },
+    "64_64_4": {
+        "num_warps": 4,
+        "TILE_S": 1,
+        "buf_size": 1,
+        "layout_option": "coprime",
+        "maxrregcount": 128
+    },
+    "32_64_4_fwd": {
+        "num_warps": 4,
+        "TILE_S": 1,
+        "buf_size": 1,
+        "layout_option": "coprime",
+        "maxrregcount": 128,
+        "copy_layout_shape": [
+            8,
+            4
+        ],
+        "mma_shape": [
+            16,
+            8,
+            16
+        ]
+    },
+    "32_64_4_bwd": {
+        "num_warps": 2,
+        "TILE_S": 1,
+        "buf_size": 1,
+        "layout_option": "multiple",
+        "maxrregcount": 128,
+        "copy_layout_shape": [
+            8,
+            4
+        ],
+        "mma_shape": [
+            16,
+            8,
+            16
+        ]
+    },
+    "64_32_4_fwd": {
+        "num_warps": 4,
+        "TILE_S": 1,
+        "buf_size": 1,
+        "layout_option": "coprime",
+        "maxrregcount": 255,
+        "copy_layout_shape": [
+            8,
+            4
+        ],
+        "mma_shape": [
+            16,
+            8,
+            16
+        ]
+    },
+    "64_32_4_bwd": {
+        "num_warps": 4,
+        "TILE_S": 1,
+        "buf_size": 1,
+        "layout_option": "coprime",
+        "maxrregcount": 255,
+        "copy_layout_shape": [
+            8,
+            4
+        ],
+        "mma_shape": [
+            16,
+            8,
+            16
+        ]
+    }
+}

@@ -6,12 +6,12 @@ import torch
 def apply_rope(x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.Tensor:
     """
     x might be q or k or qk, of shape [batch, num_heads, (1/2), seq_len, d_head]
-    sin/cos of shape [(batch/1), (num_heads/1), (seq_len), (d_head)]
+    sin/cos of shape [(batch/1), (num_heads/1), (seq_len), (d_head // 2)]
     """
     x_dtype = x.dtype
     rope_dtype = cos.dtype
 
-    assert x.shape[-1] == cos.shape[-1], "cos/sin dim must be equal to x dim"
+    assert x.shape[-1] // 2 == cos.shape[-1], "cos/sin dim must be equal to x dim // 2"
     assert rope_dtype == torch.float32, "cos/sin must be float32 for numerical stability"
 
     # FIX: Capture the original shape to prevent the 5D leak
@@ -42,12 +42,10 @@ def apply_rope(x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.T
 
     # EXPLICIT CHUNKING: Maximum compiler fusion, zero hidden allocations
     x1, x2 = x_fp32.chunk(2, dim=-1)
-    c1, c2 = cos.chunk(2, dim=-1)
-    s1, s2 = sin.chunk(2, dim=-1)
 
-    # Forward rotation
-    out1 = x1 * c1 - x2 * s1
-    out2 = x2 * c2 + x1 * s2
+    # Forward rotation using half-dim cos/sin directly twice
+    out1 = x1 * cos - x2 * sin
+    out2 = x2 * cos + x1 * sin
 
     out = torch.cat((out1, out2), dim=-1).to(x_dtype)
 

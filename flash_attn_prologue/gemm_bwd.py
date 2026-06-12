@@ -21,9 +21,10 @@ from quack import copy_utils
 from flash_attn_prologue.autotune import get_autotuned_config
 
 def _ensure_contiguous(t):
-    if torch.compiler.is_compiling():
-        return t.contiguous()
-    return t if t.stride(-1) == 1 else t.contiguous()
+    if t.is_contiguous():
+        return t
+    return t.contiguous()
+
 
 class GemmBwdDxCute:
     def __init__(self, num_warps: int = 4, BLOCK_M: int = 64, BLOCK_N: int = 64, BLOCK_K_STAGE: int = 32, ab_stage: int = 3, B: int = 32, N: int = 512, M_dim = None, K_dim: int = 3072, N_dim: int = 512, NUM_HEADS: int = 16, HEAD_DIM: int = 64, q_strides=None, k_strides=None, v_strides=None, swizzle_x: int = 8, atom_layout_mnk = None):
@@ -417,7 +418,7 @@ class GemmBwdDxCute:
         cute.arch.setmaxregister_increase(248)
         
         # Main execution loop
-        for k_tile in cutlass.range_constexpr(k_tile_cnt):
+        for k_tile in cutlass.range(k_tile_cnt):
             pipe_read = k_tile % self.ab_stage
             pipe_write = (k_tile + self.ab_stage - 1) % self.ab_stage
             next_pipe_read = (k_tile + 1) % self.ab_stage
@@ -1036,7 +1037,7 @@ class SplitKReductionCute:
             if row < self.M_dim and col < self.N_dim:
                 val = Float32(0.0)
                 for k in cutlass.range(self.SPLIT_K):
-                    val += workspace_ptr[k * self.M_dim * self.N_dim + row * self.N_dim + col]
+                    val += Float32(workspace_ptr[k * self.M_dim * self.N_dim + row * self.N_dim + col])
                 if const_expr(self.accumulate):
                     out_ptr[row * self.N_dim + col] = BFloat16(Float32(out_ptr[row * self.N_dim + col]) + val)
                 else:
@@ -1047,9 +1048,7 @@ _workspace_cache = {}
 def get_workspace_tensor(shape, dtype, device):
     key = (shape, dtype, device)
     if key not in _workspace_cache:
-        _workspace_cache[key] = torch.zeros(shape, dtype=dtype, device=device)
-    else:
-        _workspace_cache[key].zero_()
+        _workspace_cache[key] = torch.empty(shape, dtype=dtype, device=device)
     return _workspace_cache[key]
 
 _reduction_compile_cache = {}
@@ -1058,7 +1057,7 @@ def get_reduction_kernel(M_dim, N_dim, SPLIT_K, accumulate=False):
     key = (M_dim, N_dim, SPLIT_K, accumulate)
     if key not in _reduction_compile_cache:
         op = SplitKReductionCute(M_dim, N_dim, SPLIT_K, accumulate=accumulate)
-        workspace_fake = make_fake_tensor(Float32, (SPLIT_K, M_dim, N_dim), 16)
+        workspace_fake = make_fake_tensor(BFloat16, (SPLIT_K, M_dim, N_dim), 16)
         out_fake = make_fake_tensor(BFloat16, (M_dim, N_dim), 16)
         fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         compiled_fn = cute.compile(
@@ -1152,7 +1151,7 @@ def get_matmul_bwd_dw_kernel(num_warps=4, BLOCK_M=64, BLOCK_N=64, BLOCK_K_STAGE=
         grad_k_fake = make_fake_tensor(BFloat16, (B, NUM_HEADS, N, HEAD_DIM), 16)
         grad_v_fake = make_fake_tensor(BFloat16, (B, NUM_HEADS, N, HEAD_DIM), 16)
         x_fake = make_fake_tensor(BFloat16, (K_dim, N_dim), 16)
-        grad_weight_dtype = BFloat16 if SPLIT_K == 1 else Float32
+        grad_weight_dtype = BFloat16
         grad_weight_fake = make_fake_tensor(grad_weight_dtype, (SPLIT_K * M_dim, N_dim), 16)
         
         fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -1317,7 +1316,7 @@ def _matmul_bwd_dw_cute_op(
         
     if split_k > 1:
         # Use cached/pre-allocated workspace to prevent dynamic memory allocation overhead
-        workspace = get_workspace_tensor((split_k, M_dim, N_dim), dtype=torch.float32, device=grad_q.device)
+        workspace = get_workspace_tensor((split_k, M_dim, N_dim), dtype=torch.bfloat16, device=grad_q.device)
         workspace_flat = workspace.view(split_k * M_dim, N_dim)
         kernel(grad_q, grad_k, grad_v, x_flat, workspace_flat)
         
@@ -1410,7 +1409,7 @@ def _matmul_bwd_dw_accumulate_cute_op(
         
     if split_k > 1:
         # Use cached/pre-allocated workspace to prevent dynamic memory allocation overhead
-        workspace = get_workspace_tensor((split_k, M_dim, N_dim), dtype=torch.float32, device=grad_q.device)
+        workspace = get_workspace_tensor((split_k, M_dim, N_dim), dtype=torch.bfloat16, device=grad_q.device)
         workspace_flat = workspace.view(split_k * M_dim, N_dim)
         kernel(grad_q, grad_k, grad_v, x_flat, workspace_flat)
         
@@ -1538,7 +1537,7 @@ def fused_qkv_backward(
     
     if split_k > 1:
         # Use cached/pre-allocated workspace to prevent dynamic memory allocation overhead
-        workspace = get_workspace_tensor((split_k, M_dim_dw, N_dim), dtype=torch.float32, device=grad_q.device)
+        workspace = get_workspace_tensor((split_k, M_dim_dw, N_dim), dtype=torch.bfloat16, device=grad_q.device)
         workspace_flat = workspace.view(split_k * M_dim_dw, N_dim)
         dw_kernel(grad_q, grad_k, grad_v, x_flat, workspace_flat)
         

@@ -12,9 +12,13 @@ This project contains a high-performance custom CUDA kernel implementation for a
 - Triton Standalone Epilogue: A standalone Triton kernel (`qknorm_rope_scale`) fusing epilogue operations after a standard PyTorch linear layer.
 - **CuTe Standalone Epilogue:** High-performance, layout-agnostic standalone forward and backward CuTe epilogue operators (`qknorm_rope_scale_cute_op` / `qknorm_rope_scale_cute_backward_op`) that mutate separate Q/K tensors in-place, specialize on strides at JIT compile time to eliminate `.contiguous()` conversions, and run up to 2.33x faster than Triton.
 - **Blackwell TMA-based Backward GEMM Kernels:** Features high-performance JIT-compiled backward GEMM kernels (`matmul_bwd_dx` and `matmul_bwd_dw`) utilizing hardware TMA loads, asynchronous `mbarrier` transaction barriers, and a custom on-chip JIT Split-K reduction kernel on SM120.
+- **Nested Incremental Counter Loop Optimization:** Eliminates dynamic integer division and modulo calculations from the hot path of dynamic loops in backward kernels, replacing them with fast nested incremental counter registers.
 - **Dynamic Register Fine-Tuning & Register-Level Epilogue Cast:** Minimizes register pressure via dynamic nvvm setmaxregister controls and completely eliminates dynamic shared memory epilogue writeback buffer allocations by casting accumulator fragments directly in registers and storing via BFloat16 MMA partition layout maps.
 - **Autotuning Grid Swizzling:** Autotunes the grid swizzle factors (`swizzle_x` values `[1, 2, 4, 8, 16]`) to optimize hardware L2 cache saturation on SM120.
+- **Bandwidth-Optimized RoPE Buffer Size & On-Chip Reuse:** Accepts `sin`/`cos` buffers of shape `[..., dhead // 2]` directly (halving memory footprint and loading bandwidth), and processes the positional rotation twice on-chip inside the FWD/BWD JIT kernels.
+- **Inverse Epilogue Operator (Activation Recomputation):** Standalone memory-efficient inverse epilogue operator (`qknorm_rope_scale_cute_inverse_op`) that reconstructs the forward inputs $Q$ and $K$ on-chip in registers during the backward pass using the forward outputs and low-overhead scale factors (`rms_q`, `rms_k`), eliminating input VRAM storage and saving 64x activation memory.
 - **torch.compile Integration:** Fully compatible with `torch.compile` via custom PyTorch operator registration and custom schema definitions.
+- **Temporal Mamba 3 Scan Kernels:** Coordinate-descent autotuned forward and backward scan kernels using the CuTe Python DSL. Features independent FWD/BWD profiling and caching, a hybrid search algorithm (wide grid search followed by deep coordinate descent), warp-shuffle elimination via shared memory broadcasts in the backward pass, and advanced performance optimizations (two-pass parameter gradient workspace reduction to eliminate global atomic collisions, compile-time AST rank loop unrolling, and direct-to-global epilogue store for states to bypass 64KB SMEM writeback buffers), achieving 100% correctness parity and up to **2.08x speedup** (FWD+BWD) vs PyTorch Inductor.
 
 ## Installation
 
@@ -30,47 +34,34 @@ pip install -e .
 
 ## Running Tests and Benchmarks
 
-Verify the base CuTe forward pass compilation and correctness:
-```bash
-PYTHONPATH=. python tests/test_fused_qkv_cute.py
-```
+Verify correctness of the package with active tests (no extra environment variables required):
 
-Verify the Split-N CuTe kernel forward/backward correctness and benchmark performance:
-```bash
-PYTHONPATH=. python tests/test_fused_qkv_cute_splitn.py
-```
+- **Verify the cloned and adapted TMA-based backward GEMM kernels (`matmul_bwd_dx` and `matmul_bwd_dw`)**:
+  ```bash
+  pytest tests/test_gemm_bwd_clone.py
+  ```
 
-Verify the Triton standalone epilogue kernel:
-```bash
-PYTHONPATH=. pytest tests/test_epilogue_kernel.py
-```
+- **Verify and benchmark the fully integrated Fused QKV Forward + Fused TMA-based Backward pass**:
+  ```bash
+  pytest -s tests/test_fused_qkv_bwd.py
+  ```
 
-Run the detailed component latency breakdown benchmark (GEMM vs Epilogue):
-```bash
-PYTHONPATH=. python tests/test_pure_gemm.py
-```
+- **Verify the main Fused QKV Forward operator correctness**:
+  ```bash
+  pytest tests/test_fused_qkv.py
+  ```
 
-Verify the Pipelined cp.async GEMM kernel forward correctness and benchmark performance:
-```bash
-PYTHONPATH=. python tests/test_pipelined_gemm.py
-```
+- **Verify the Fused QKV Epilogue chained operator**:
+  ```bash
+  pytest tests/test_fused_qkv_epilogue.py
+  ```
 
-Verify the Milestone 1 Fused QKV (GEMM + RMSNorm) kernel correctness and benchmark performance:
-```bash
-PYTHONPATH=. python tests/test_fused_pipelined.py
-```
+- **Verify the Temporal Mamba 3 FWD/BWD CuTe kernels parity against eager PyTorch**:
+  ```bash
+  python temporal_mamba3/test_mamba3_parity.py
+  ```
 
-Verify the resource-optimized Fused QKV Overlap kernel:
-```bash
-PYTHONPATH=. CUTE_DSL_LIBS=/home/achiya/vs_code_main/flash_attn_prologue/.venv/lib/python3.13/site-packages/nvidia_cutlass_dsl/lib/libcute_dsl_runtime.so .venv/bin/python tests/test_fused_qkv_overlap.py
-```
-
-Verify the cloned and adapted TMA-based backward GEMM kernels (`matmul_bwd_dx` and `matmul_bwd_dw`):
-```bash
-PYTHONPATH=. CUTE_DSL_LIBS=/home/achiya/vs_code_main/flash_attn_prologue/.venv/lib/python3.13/site-packages/nvidia_cutlass_dsl/lib/libcute_dsl_runtime.so .venv/bin/pytest tests/test_gemm_bwd_clone.py
-```
-
-Verify and benchmark the fully integrated Fused QKV Forward + Fused TMA-based Backward pass:
-```bash
-PYTHONPATH=. CUTE_DSL_LIBS=/home/achiya/vs_code_main/flash_attn_prologue/.venv/lib/python3.13/site-packages/nvidia_cutlass_dsl/lib/libcute_dsl_runtime.so .venv/bin/pytest -s tests/test_fused_qkv_bwd.py
-```
+- **Benchmark and compare the Temporal Mamba 3 CuTe kernel against eager PyTorch and PyTorch Inductor Compiled**:
+  ```bash
+  python temporal_mamba3/benchmark_mamba3.py
+  ```

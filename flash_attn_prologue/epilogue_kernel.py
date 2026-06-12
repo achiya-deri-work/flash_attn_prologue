@@ -97,22 +97,20 @@ def qknorm_rope_scale_triton_kernel(
     k_norm1 = k_1 * k_rsqrt * w_k1
     k_norm2 = k_2 * k_rsqrt * w_k2
 
-    # 2. RoPE
+    # 2. RoPE (On-chip reuse: load HALF_DIM sin/cos once and reuse twice)
     sin_base = sin_ptr + pid_b * stride_sin_b
     cos_base = cos_ptr + pid_b * stride_sin_b
     
     sin_n_offset = offs_n[:, None] * stride_sin_n
     
-    sin_1 = tl.load(sin_base + sin_n_offset + cols_first[None, :], mask=mask_n, other=0.0).to(tl.float32)
-    sin_2 = tl.load(sin_base + sin_n_offset + cols_second[None, :], mask=mask_n, other=0.0).to(tl.float32)
-    cos_1 = tl.load(cos_base + sin_n_offset + cols_first[None, :], mask=mask_n, other=0.0).to(tl.float32)
-    cos_2 = tl.load(cos_base + sin_n_offset + cols_second[None, :], mask=mask_n, other=0.0).to(tl.float32)
+    sin_val = tl.load(sin_base + sin_n_offset + cols_first[None, :], mask=mask_n, other=0.0).to(tl.float32)
+    cos_val = tl.load(cos_base + sin_n_offset + cols_first[None, :], mask=mask_n, other=0.0).to(tl.float32)
 
-    q_roped1 = q_norm1 * cos_1 - q_norm2 * sin_1
-    q_roped2 = q_norm2 * cos_2 + q_norm1 * sin_2
+    q_roped1 = q_norm1 * cos_val - q_norm2 * sin_val
+    q_roped2 = q_norm2 * cos_val + q_norm1 * sin_val
     
-    k_roped1 = k_norm1 * cos_1 - k_norm2 * sin_1
-    k_roped2 = k_norm2 * cos_2 + k_norm1 * sin_2
+    k_roped1 = k_norm1 * cos_val - k_norm2 * sin_val
+    k_roped2 = k_norm2 * cos_val + k_norm1 * sin_val
 
     # 3. Scales for Q
     scale_val = tl.load(scales_ptr + pid_h).to(tl.float32)
@@ -210,9 +208,10 @@ def qknorm_rope_scale_eager(qkv, rmsnorm_weight, scales, sin, cos, eps=1e-5):
         
     q_normed_fp32 = q_normed.float()
     k_normed_fp32 = k_normed.float()
-    
-    q_roped_fp32 = (q_normed_fp32 * cos) + (rotate_half(q_normed_fp32) * sin)
-    k_roped_fp32 = (k_normed_fp32 * cos) + (rotate_half(k_normed_fp32) * sin)
+    cos_full = torch.cat((cos, cos), dim=-1)
+    sin_full = torch.cat((sin, sin), dim=-1)
+    q_roped_fp32 = (q_normed_fp32 * cos_full) + (rotate_half(q_normed_fp32) * sin_full)
+    k_roped_fp32 = (k_normed_fp32 * cos_full) + (rotate_half(k_normed_fp32) * sin_full)
     
     q_proj = q_roped_fp32.to(q.dtype) * scales.float().exp().to(q.dtype)
     k_proj = k_roped_fp32.to(k.dtype)
@@ -309,8 +308,10 @@ def qknorm_rope_scale_backward_hook(ctx, grad_q, grad_k, grad_v):
     # 2. Gradient of Scale and RoPE backward
     scale_factor_bf16 = scales.float().exp().to(qkv.dtype)
     grad_q_scaled = grad_q * scale_factor_bf16
-    grad_q_normed = (grad_q_scaled.float() * cos) + rotate_half_backward(grad_q_scaled.float() * sin)
-    grad_k_normed = (grad_k.float() * cos) + rotate_half_backward(grad_k.float() * sin)
+    cos_full = torch.cat((cos, cos), dim=-1)
+    sin_full = torch.cat((sin, sin), dim=-1)
+    grad_q_normed = (grad_q_scaled.float() * cos_full) + rotate_half_backward(grad_q_scaled.float() * sin_full)
+    grad_k_normed = (grad_k.float() * cos_full) + rotate_half_backward(grad_k.float() * sin_full)
     
     grad_q_normed = grad_q_normed.to(qkv.dtype)
     grad_k_normed = grad_k_normed.to(qkv.dtype)
@@ -340,7 +341,9 @@ def qknorm_rope_scale_backward_hook(ctx, grad_q, grad_k, grad_v):
     
     # 5. Gradient of scales parameter
     q_normed_fp32 = q_normed.float()
-    q_roped_fp32 = (q_normed_fp32 * cos) + (rotate_half(q_normed_fp32) * sin)
+    cos_full = torch.cat((cos, cos), dim=-1)
+    sin_full = torch.cat((sin, sin), dim=-1)
+    q_roped_fp32 = (q_normed_fp32 * cos_full) + (rotate_half(q_normed_fp32) * sin_full)
     q_roped = q_roped_fp32.to(qkv.dtype)
     
     grad_scales = (grad_q * q_roped).float().sum(dim=(0, 2, 3)).view(num_heads, 1, 1).to(scales.dtype)

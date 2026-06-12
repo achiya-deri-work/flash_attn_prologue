@@ -2,7 +2,7 @@ import os
 import json
 import torch
 import math
-from typing import Dict, Any
+from typing import Dict, Any, Optional, List
 
 CACHE_FILE = os.path.join(os.path.dirname(__file__), "autotune_cache.json")
 
@@ -116,6 +116,11 @@ def is_config_valid(config: Dict[str, Any], mode: str) -> bool:
         threads_row = num_threads // threads_col
         if val_m % threads_row != 0:
             return False
+        # Global store boundary constraints for tiled copy
+        store_thr_m = min(16, bm)
+        store_thr_n = num_threads // store_thr_m
+        if store_thr_n * 8 > bn:
+            return False
             
     # 7. Additional constraints for epilogue mode
     if mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
@@ -148,7 +153,46 @@ def get_b_n_seq(total_elements):
     # Fallback
     return 1, total_elements
 
-def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[str, int]:
+def get_smem_bytes(mode, bm, bn, bk, hg, stage, pad=0, K=64):
+    if mode == "fused_qkv":
+        block_n = hg * 3 * 64
+        mainloop_bytes = (stage * bm * bk * 2) + (stage * block_n * bk * 2)
+        epilogue_bytes = bm * (block_n + 8) * 4
+        return max(mainloop_bytes, epilogue_bytes)
+    elif mode == "bwd_dx":
+        sX_bytes = stage * bm * bk * 3 * 2
+        sW_bytes = stage * bn * (bk + pad) * 3 * 2
+        mainloop_bytes = sX_bytes + sW_bytes
+        epilogue_bytes = bm * (bn + 8) * 2
+        return max(mainloop_bytes, epilogue_bytes)
+    elif mode == "bwd_dw":
+        sX_bytes = stage * bm * bk * 3 * 2
+        sW_bytes = stage * bn * bk * 2
+        mainloop_bytes = sX_bytes + sW_bytes
+        epilogue_bytes = 3 * bm * (bn + 8) * 2
+        return max(mainloop_bytes, epilogue_bytes)
+    elif mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
+        if mode == "epilogue_bwd":
+            s_rmsnorm_reduction_elems = bm * 2 * hg * K
+            s_scales_offset = ((s_rmsnorm_reduction_elems + 31) // 32) * 32
+            total_elems = s_scales_offset + bm * hg
+            flat_smem_elements = ((total_elems + 31) // 32) * 32
+            return flat_smem_elements * 4
+        else:
+            block_n = hg * K
+            block_n_padded = block_n + 8
+            smem_bytes = 2 * (bm * block_n_padded * 2)
+            if mode == "epilogue":
+                s_rmsnorm_reduction_elems = bm * 2 * hg * K
+                s_scales_offset = ((s_rmsnorm_reduction_elems + 31) // 32) * 32
+                total_elems = s_scales_offset + bm * hg
+                flat_smem_elements = ((total_elems + 31) // 32) * 32
+                bwd_smem_bytes = flat_smem_elements * 4
+                smem_bytes = max(smem_bytes, bwd_smem_bytes)
+            return smem_bytes
+    return 0
+
+def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str, initial_config: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
     if isinstance(is_fused, bool):
         mode = "fused" if is_fused else "gemm"
     else:
@@ -301,8 +345,8 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                 
                 rmsnorm_weight_prof = torch.randn(2, 1, head_dim, device=device, dtype=torch.float32)
                 scales_prof = torch.randn(num_heads, 1, 1, device=device, dtype=torch.float32)
-                sin_prof = torch.randn(B_prof, 1, seq_prof, head_dim, device=device, dtype=torch.float32)
-                cos_prof = torch.randn(B_prof, 1, seq_prof, head_dim, device=device, dtype=torch.float32)
+                sin_prof = torch.randn(B_prof, 1, seq_prof, head_dim // 2, device=device, dtype=torch.float32)
+                cos_prof = torch.randn(B_prof, 1, seq_prof, head_dim // 2, device=device, dtype=torch.float32)
                 
                 q_out = torch.empty(B_prof, num_heads, seq_prof, head_dim, device=device, dtype=torch.bfloat16)
                 k_out = torch.empty(B_prof, num_heads, seq_prof, head_dim, device=device, dtype=torch.bfloat16)
@@ -426,12 +470,12 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                     accumulate=False,
                     atom_layout_mnk=config.get("atom_layout_mnk", None)
                 )
-                grad_weight_prof = torch.zeros((split_k * prof_M, prof_N), device=device, dtype=torch.float32)
+                grad_weight_prof = torch.zeros((split_k * prof_M, prof_N), device=device, dtype=torch.bfloat16)
                 
                 dw_kernel(ref_data["grad_q_prof"], ref_data["grad_k_prof"], ref_data["grad_v_prof"], ref_data["x_prof"], grad_weight_prof)
                 
                 if split_k > 1:
-                    grad_weight_prof_summed = grad_weight_prof.view(split_k, prof_M, prof_N).sum(dim=0).to(torch.bfloat16)
+                    grad_weight_prof_summed = grad_weight_prof.view(split_k, prof_M, prof_N).float().sum(dim=0).to(torch.bfloat16)
                 else:
                     grad_weight_prof_summed = grad_weight_prof.to(torch.bfloat16)
                     
@@ -465,10 +509,10 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                 
                 q_prof = torch.randn(B_prof, num_heads, seq_prof, head_dim, device=device, dtype=torch.bfloat16)
                 k_prof = torch.randn(B_prof, num_heads, seq_prof, head_dim, device=device, dtype=torch.bfloat16)
-                rmsnorm_weight_prof = torch.randn(2, 1, head_dim, device=device, dtype=torch.float32)
-                scales_prof = torch.randn(num_heads, 1, 1, device=device, dtype=torch.float32)
-                sin_prof = torch.randn(B_prof, 1, seq_prof, head_dim, device=device, dtype=torch.float32)
-                cos_prof = torch.randn(B_prof, 1, seq_prof, head_dim, device=device, dtype=torch.float32)
+                rmsnorm_weight_prof = torch.randn(2, 1, head_dim, device=device, dtype=torch.bfloat16)
+                scales_prof = torch.randn(num_heads, 1, 1, device=device, dtype=torch.bfloat16)
+                sin_prof = torch.randn(B_prof, 1, seq_prof, head_dim // 2, device=device, dtype=torch.float32)
+                cos_prof = torch.randn(B_prof, 1, seq_prof, head_dim // 2, device=device, dtype=torch.float32)
                 
                 fwd_kernel = None
                 back_kernel = None
@@ -481,11 +525,21 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                         HEAD_DIM=head_dim,
                         HEAD_GROUP=hg,
                         ab_stage=config.get("ab_stage", 1),
-                        q_strides=q_prof.stride(),
-                        k_strides=k_prof.stride(),
+                        q_in_strides=q_prof.stride(),
+                        k_in_strides=k_prof.stride(),
+                        q_out_strides=q_prof.stride(),
+                        k_out_strides=k_prof.stride(),
                         sin_strides=sin_prof.stride(),
                         cos_strides=cos_prof.stride(),
-                        maxrregcount=regs
+                        maxrregcount=regs,
+                        B=B_prof,
+                        N=seq_prof,
+                        q_dtype=q_prof.dtype,
+                        k_dtype=k_prof.dtype,
+                        weight_dtype=rmsnorm_weight_prof.dtype,
+                        scales_dtype=scales_prof.dtype,
+                        sin_dtype=sin_prof.dtype,
+                        cos_dtype=cos_prof.dtype
                     )
                 
                 if mode in ("epilogue", "epilogue_bwd"):
@@ -500,7 +554,15 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                         k_strides=k_prof.stride(),
                         sin_strides=sin_prof.stride(),
                         cos_strides=cos_prof.stride(),
-                        maxrregcount=regs
+                        maxrregcount=regs,
+                        B=B_prof,
+                        N=seq_prof,
+                        q_dtype=q_prof.dtype,
+                        k_dtype=k_prof.dtype,
+                        weight_dtype=rmsnorm_weight_prof.dtype,
+                        scales_dtype=scales_prof.dtype,
+                        sin_dtype=sin_prof.dtype,
+                        cos_dtype=cos_prof.dtype
                     )
                 
                 grad_q_prof = torch.randn_like(q_prof)
@@ -509,10 +571,12 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                 dk_prof = torch.empty_like(k_prof)
                 dw_prof = torch.zeros((2, 1, head_dim), device=device, dtype=torch.float32)
                 ds_prof = torch.zeros((num_heads, 1, 1), device=device, dtype=torch.float32)
+                q_out_prof = torch.empty_like(q_prof)
+                k_out_prof = torch.empty_like(k_prof)
                 
                 # Warmup
                 if fwd_kernel is not None:
-                    fwd_kernel(q_prof, k_prof, rmsnorm_weight_prof, scales_prof, sin_prof, cos_prof)
+                    fwd_kernel(q_prof, k_prof, q_out_prof, k_out_prof, rmsnorm_weight_prof, scales_prof, sin_prof, cos_prof)
                 if back_kernel is not None:
                     back_kernel(
                         q_prof, k_prof, rmsnorm_weight_prof, scales_prof, sin_prof, cos_prof,
@@ -525,7 +589,7 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                 start_event.record()
                 for _ in range(15):
                     if fwd_kernel is not None:
-                        fwd_kernel(q_prof, k_prof, rmsnorm_weight_prof, scales_prof, sin_prof, cos_prof)
+                        fwd_kernel(q_prof, k_prof, q_out_prof, k_out_prof, rmsnorm_weight_prof, scales_prof, sin_prof, cos_prof)
                     if back_kernel is not None:
                         back_kernel(
                             q_prof, k_prof, rmsnorm_weight_prof, scales_prof, sin_prof, cos_prof,
@@ -563,16 +627,20 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                     num_threads = 128  # default Stage 1 warps=4
                     if num_threads < bm * hg:
                         continue
-                    block_n = hg * 3 * 64
-                    mainloop_bytes = (3 * bm * bk * 2) + (3 * block_n * bk * 2)
-                    epilogue_bytes = bm * (block_n + 8) * 4
-                    smem_bytes = max(mainloop_bytes, epilogue_bytes)
-                    if smem_bytes <= 99 * 1024:
+                    
+                    best_stage = None
+                    for stage in [4, 3, 2]:
+                        smem_bytes = get_smem_bytes(mode, bm, None, bk, hg, stage)
+                        if smem_bytes <= 99 * 1024:
+                            best_stage = stage
+                            break
+                    
+                    if best_stage is not None:
                         candidate = {
                             "HEAD_GROUP": hg,
                             "BLOCK_M": bm,
                             "BLOCK_K": bk,
-                            "ab_stage": 3,
+                            "ab_stage": best_stage,
                             "num_warps": 4,
                             "maxrregcount": 255,
                             "swizzle_x": 8,
@@ -591,17 +659,20 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                     if prof_K % bk != 0:
                         continue
                     
-                    sX_bytes = 3 * bm * bk * 3 * 2
-                    sW_bytes = 3 * bn * bk * 3 * 2
-                    mainloop_bytes = sX_bytes + sW_bytes
-                    epilogue_bytes = bm * (bn + 8) * 2
-                    smem_bytes = max(mainloop_bytes, epilogue_bytes)
-                    if smem_bytes <= 99 * 1024:
+                    best_stage = None
+                    for stage in [3, 2]:
+                        pad = 8 if (bk // 16) > 1 else 0
+                        smem_bytes = get_smem_bytes(mode, bm, bn, bk, None, stage, pad)
+                        if smem_bytes <= 99 * 1024:
+                            best_stage = stage
+                            break
+                            
+                    if best_stage is not None:
                         candidate = {
                             "BLOCK_M": bm,
                             "BLOCK_N": bn,
                             "BLOCK_K": bk,
-                            "ab_stage": 3,
+                            "ab_stage": best_stage,
                             "num_warps": 4,
                             "maxrregcount": 255,
                             "swizzle_x": 8,
@@ -620,17 +691,19 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
                     if prof_K % bk != 0:
                         continue
                         
-                    sX_bytes = 3 * bm * bk * 3 * 2
-                    sW_bytes = 3 * bn * bk * 2
-                    mainloop_bytes = sX_bytes + sW_bytes
-                    epilogue_bytes = 3 * bm * (bn + 8) * 2
-                    smem_bytes = max(mainloop_bytes, epilogue_bytes)
-                    if smem_bytes <= 99 * 1024:
+                    best_stage = None
+                    for stage in [3, 2]:
+                        smem_bytes = get_smem_bytes(mode, bm, bn, bk, None, stage)
+                        if smem_bytes <= 99 * 1024:
+                            best_stage = stage
+                            break
+                            
+                    if best_stage is not None:
                         candidate = {
                             "BLOCK_M": bm,
                             "BLOCK_N": bn,
                             "BLOCK_K": bk,
-                            "ab_stage": 3,
+                            "ab_stage": best_stage,
                             "num_warps": 4,
                             "maxrregcount": 255,
                             "SPLIT_K": 4,
@@ -704,6 +777,111 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
             return {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "ab_stage": 2, "num_warps": 4, "maxrregcount": 255, "SPLIT_K": 16, "swizzle_x": 8, "atom_layout_mnk": None}
         else:
             return {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}
+
+    if initial_config is not None:
+        print(f"[Autotune] Running Coordinate Descent starting from: {initial_config}")
+        
+        # 1. Define validator function that includes SMEM size checks
+        def is_valid(config):
+            if not is_config_valid(config, mode):
+                return False
+                
+            bm = config.get("BLOCK_M", 64)
+            bn = config.get("BLOCK_N", 64)
+            bk = config.get("BLOCK_K", 32)
+            hg = config.get("HEAD_GROUP", 1)
+            stage = config.get("ab_stage", 1)
+            
+            # Enforce limits on epilogue stage/warps/hg
+            if mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
+                if mode == "epilogue_bwd":
+                    if stage != 1:
+                        return False
+                else: # epilogue, epilogue_fwd
+                    if stage not in (1, 2):
+                        return False
+                    if bm % stage != 0:
+                        return False
+                if N % hg != 0:
+                    return False
+                if mode in ("epilogue", "epilogue_fwd") and hg > 2:
+                    return False
+                    
+            smem_bytes = get_smem_bytes(mode, bm, bn, bk, hg, stage, pad=0, K=bk)
+            if smem_bytes > 99 * 1024:
+                return False
+                
+            return True
+            
+        # 2. Define coordinate descent param_space
+        if mode in ("epilogue", "epilogue_fwd", "epilogue_bwd"):
+            param_space = {
+                "HEAD_GROUP": {"type": "power_of_2", "min": 1, "max": 16},
+                "BLOCK_M": {"type": "both", "min": 16, "max": 256},
+                "BLOCK_K": [K],
+                "ab_stage": {"type": "step_1", "min": 1, "max": 2 if mode in ("epilogue", "epilogue_fwd") else 1},
+                "num_warps": {"type": "both", "min": 2, "max": 16},
+                "maxrregcount": {"type": "maxrregcount", "min": 128, "max": 255},
+                "atom_layout_mnk": [None]
+            }
+        elif mode == "bwd_dx":
+            param_space = {
+                "BLOCK_M": {"type": "both", "min": 16, "max": 256},
+                "BLOCK_N": {"type": "power_of_2", "min": 16, "max": 256},
+                "BLOCK_K": {"type": "power_of_2", "min": 16, "max": 128},
+                "ab_stage": {"type": "step_1", "min": 2, "max": 10},
+                "num_warps": {"type": "both", "min": 2, "max": 16},
+                "maxrregcount": {"type": "maxrregcount", "min": 128, "max": 255},
+                "swizzle_x": {"type": "power_of_2", "min": 1, "max": 16},
+                "atom_layout_mnk": {"type": "custom", "fn": lambda config: get_valid_warp_layouts(config.get("num_warps", 4))}
+            }
+        elif mode == "bwd_dw":
+            param_space = {
+                "BLOCK_M": {"type": "both", "min": 16, "max": 256},
+                "BLOCK_N": {"type": "power_of_2", "min": 16, "max": 256},
+                "BLOCK_K": {"type": "power_of_2", "min": 16, "max": 128},
+                "ab_stage": {"type": "step_1", "min": 2, "max": 10},
+                "num_warps": {"type": "both", "min": 2, "max": 16},
+                "maxrregcount": {"type": "maxrregcount", "min": 128, "max": 255},
+                "SPLIT_K": {"type": "both", "min": 1, "max": 128},
+                "swizzle_x": {"type": "power_of_2", "min": 1, "max": 16},
+                "atom_layout_mnk": {"type": "custom", "fn": lambda config: get_valid_warp_layouts(config.get("num_warps", 4))}
+            }
+        elif mode == "fused_qkv":
+            param_space = {
+                "HEAD_GROUP": {"type": "power_of_2", "min": 1, "max": 16},
+                "BLOCK_M": {"type": "both", "min": 16, "max": 256},
+                "BLOCK_K": {"type": "power_of_2", "min": 16, "max": 128},
+                "ab_stage": {"type": "step_1", "min": 2, "max": 10},
+                "num_warps": {"type": "both", "min": 2, "max": 16},
+                "maxrregcount": {"type": "maxrregcount", "min": 128, "max": 255},
+                "swizzle_x": {"type": "power_of_2", "min": 1, "max": 16},
+                "atom_layout_mnk": {"type": "custom", "fn": lambda config: get_valid_warp_layouts(config.get("num_warps", 4)) + [None]}
+            }
+        else:
+            param_space = {
+                "BLOCK_M": {"type": "both", "min": 16, "max": 256},
+                "BLOCK_N": {"type": "power_of_2", "min": 16, "max": 256},
+                "BLOCK_K": {"type": "power_of_2", "min": 16, "max": 128}
+            }
+            
+        import copy
+        from flash_attn_prologue.coordinate_descent import CoordinateDescentAutotuner
+        tuner = CoordinateDescentAutotuner(
+            param_space=param_space,
+            objective_fn=profile_and_verify,
+            is_valid_fn=is_valid,
+            maximize=False,
+            max_iterations=3,
+            verbose=True
+        )
+        # Verify and coerce initial_config parameters just in case
+        start_config = copy.deepcopy(initial_config)
+        if "BLOCK_K" not in start_config:
+            start_config["BLOCK_K"] = K
+        best_config, best_time = tuner.tune(start_config)
+        print(f"[Autotune] Coordinate Descent completed. Best config: {best_config} with time: {best_time:.4f} ms")
+        return best_config
 
     print(f"[Autotune] Stage 1: Sweep over {len(tile_candidates)} tile configurations...")
     tile_results = []
@@ -839,8 +1017,8 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
     
     # ------------------ STAGE 4: COMPILER & SWIZZLE CONFIGURATIONS ------------------
     stage_4_candidates = []
-    regs_to_sweep = [80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 255] if mode not in ("epilogue", "epilogue_fwd", "epilogue_bwd") else [128, 255]
-    swizzles_to_sweep = [1, 2, 4, 8, 16, 32, 64] if mode not in ("epilogue", "epilogue_fwd", "epilogue_bwd") else [1]
+    regs_to_sweep = [128, 192, 255] if mode not in ("epilogue", "epilogue_fwd", "epilogue_bwd") else [128, 255]
+    swizzles_to_sweep = [1, 4, 8, 16] if mode not in ("epilogue", "epilogue_fwd", "epilogue_bwd") else [1]
     
     for regs in regs_to_sweep:
         for swizzle in swizzles_to_sweep:
@@ -868,7 +1046,7 @@ def profile_shapes(M: int, N: int, K: int, is_fused: Any, device: str) -> Dict[s
     print(f"[Autotune] Selection completed. Best config for mode {mode}: {best_config} with time: {best_time:.4f} ms")
     return best_config
  
-def get_autotuned_config(M: int, N: int, K: int, is_fused: Any, device: str = "cuda") -> Dict[str, int]:
+def get_autotuned_config(M: int, N: int, K: int, is_fused: Any, device: str = "cuda", initial_config: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
     if isinstance(is_fused, bool):
         mode = "fused" if is_fused else "gemm"
     else:
@@ -878,11 +1056,11 @@ def get_autotuned_config(M: int, N: int, K: int, is_fused: Any, device: str = "c
         return _autotune_in_memory_cache[key]
         
     cache = load_cache()
-    if key in cache:
+    if key in cache and initial_config is None:
         return cache[key]
         
-    print(f"[Autotune] Shape key '{key}' not found in cache. Aggressively profiling {mode} config candidates...")
-    best_config = profile_shapes(M, N, K, mode, device)
+    print(f"[Autotune] Shape key '{key}' not found in cache or autotuning triggered. Aggressively profiling {mode} config candidates...")
+    best_config = profile_shapes(M, N, K, mode, device, initial_config)
     print(f"[Autotune] Selected best config for '{key}': {best_config}")
     
     cache[key] = best_config

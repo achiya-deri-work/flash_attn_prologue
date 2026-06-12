@@ -31,8 +31,8 @@ def test_fused_qkv_epilogue_fwd_bwd_parity_and_benchmark():
     
     sin_val = torch.sin(freqs_out)
     cos_val = torch.cos(freqs_out)
-    sin = torch.cat((sin_val, sin_val), dim=-1).unsqueeze(1).contiguous()
-    cos = torch.cat((cos_val, cos_val), dim=-1).unsqueeze(1).contiguous()
+    sin = sin_val.unsqueeze(1).contiguous()
+    cos = cos_val.unsqueeze(1).contiguous()
     
     # 2. Sequential Baseline (Eager/Torch.compile custom op chain)
     x_seq = x.clone().detach().requires_grad_(True)
@@ -164,8 +164,8 @@ def test_fused_qkv_epilogue_ckp_fwd_bwd_parity_and_benchmark():
     
     sin_val = torch.sin(freqs_out)
     cos_val = torch.cos(freqs_out)
-    sin = torch.cat((sin_val, sin_val), dim=-1).unsqueeze(1).contiguous()
-    cos = torch.cat((cos_val, cos_val), dim=-1).unsqueeze(1).contiguous()
+    sin = sin_val.unsqueeze(1).contiguous()
+    cos = cos_val.unsqueeze(1).contiguous()
     
     # 2. Sequential Baseline
     x_seq = x.clone().detach().requires_grad_(True)

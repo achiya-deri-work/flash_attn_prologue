@@ -3,9 +3,23 @@ import torch
 import math
 
 def _ensure_contiguous(t):
-    if torch.compiler.is_compiling():
-        return t.contiguous()
-    return t if t.stride(-1) == 1 else t.contiguous()
+    if t.is_contiguous():
+        return t
+    return t.contiguous()
+
+
+def _ensure_4d(t: torch.Tensor) -> torch.Tensor:
+    if t.ndim == 5:
+        if t.shape[2] == 1:
+            return t.squeeze(2)
+        elif t.shape[1] == 1:
+            return t.squeeze(1)
+    elif t.ndim == 3:
+        return t.unsqueeze(1)
+    elif t.ndim == 2:
+        return t.unsqueeze(0).unsqueeze(1)
+    return t
+
 
 # Set architecture target to Blackwell
 os.environ["CUTE_DSL_ARCH"] = "sm_120a"
@@ -685,6 +699,8 @@ def fused_qkv_epilogue_op(
     sin: torch.Tensor,
     cos: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    sin = _ensure_4d(sin)
+    cos = _ensure_4d(cos)
     x = _ensure_contiguous(x)
     weight = _ensure_contiguous(weight)
     
@@ -746,7 +762,21 @@ def fused_qkv_epilogue_op(
     k_final.copy_(k_proj_bf16)
     
     # 2. Epilogue (in-place on q_final and k_final)
-    fwd_epi_kernel = _epilogue_fwd_kernel_cache.get(shape_key)
+    q_strides = q_final.stride()
+    k_strides = k_final.stride()
+    
+    sin_c = sin if sin.is_contiguous() else sin.contiguous()
+    cos_c = cos if cos.is_contiguous() else cos.contiguous()
+    sin_strides = sin_c.stride()
+    cos_strides = cos_c.stride()
+    
+    cache_key = (
+        B, N, num_heads, head_dim,
+        q_strides, k_strides, sin_strides, cos_strides,
+        tuple(sin_c.shape), tuple(cos_c.shape),
+        q_final.dtype, k_final.dtype, rmsnorm_weight.dtype, scales.dtype, sin_c.dtype, cos_c.dtype
+    )
+    fwd_epi_kernel = _epilogue_fwd_kernel_cache.get(cache_key)
     if fwd_epi_kernel is None:
         config = get_autotuned_config(M=N, N=num_heads, K=head_dim, is_fused="epilogue_fwd")
         BLOCK_M = config["BLOCK_M"]
@@ -755,11 +785,6 @@ def fused_qkv_epilogue_op(
         num_warps = config.get("num_warps", 4)
         maxrregcount = config.get("maxrregcount", 255)
         
-        q_strides = q_final.stride()
-        k_strides = k_final.stride()
-        sin_strides = sin.stride()
-        cos_strides = cos.stride()
-        
         fwd_epi_kernel = get_fused_epilogue_kernel(
             num_warps=num_warps,
             BLOCK_M=BLOCK_M,
@@ -767,21 +792,31 @@ def fused_qkv_epilogue_op(
             HEAD_DIM=head_dim,
             HEAD_GROUP=HEAD_GROUP,
             ab_stage=ab_stage,
-            q_strides=q_strides,
-            k_strides=k_strides,
+            q_in_strides=q_strides,
+            k_in_strides=k_strides,
+            q_out_strides=q_strides,
+            k_out_strides=k_strides,
             sin_strides=sin_strides,
             cos_strides=cos_strides,
-            maxrregcount=maxrregcount
+            maxrregcount=maxrregcount,
+            B=B,
+            N=N,
+            sin_shape=tuple(sin_c.shape),
+            cos_shape=tuple(cos_c.shape),
+            q_dtype=q_final.dtype,
+            k_dtype=k_final.dtype,
+            weight_dtype=rmsnorm_weight.dtype,
+            scales_dtype=scales.dtype,
+            sin_dtype=sin_c.dtype,
+            cos_dtype=cos_c.dtype
         )
-        _epilogue_fwd_kernel_cache[shape_key] = fwd_epi_kernel
+        _epilogue_fwd_kernel_cache[cache_key] = fwd_epi_kernel
         
-    rmsnorm_weight_32 = rmsnorm_weight if rmsnorm_weight.dtype == torch.float32 and rmsnorm_weight.is_contiguous() else rmsnorm_weight.to(torch.float32).contiguous()
-    scales_32 = scales if scales.dtype == torch.float32 and scales.is_contiguous() else scales.to(torch.float32).contiguous()
-    sin_32 = sin if sin.dtype == torch.float32 and sin.is_contiguous() else sin.to(torch.float32).contiguous()
-    cos_32 = cos if cos.dtype == torch.float32 and cos.is_contiguous() else cos.to(torch.float32).contiguous()
+    rmsnorm_weight_c = rmsnorm_weight if rmsnorm_weight.is_contiguous() else rmsnorm_weight.contiguous()
+    scales_c = scales if scales.is_contiguous() else scales.contiguous()
     
     fwd_epi_kernel(
-        q_final, k_final, rmsnorm_weight_32, scales_32, sin_32, cos_32
+        q_final, k_final, q_final, k_final, rmsnorm_weight_c, scales_c, sin_c, cos_c
     )
     return q_final, k_final, v_proj_bf16, q_proj_bf16, k_proj_bf16
 
@@ -799,146 +834,24 @@ def _fused_qkv_epilogue_fake(x, weight, rmsnorm_weight, scales, sin, cos):
 
 def _fused_qkv_epilogue_backward(ctx, grad_q, grad_k, grad_v, grad_q_saved, grad_k_saved):
     x, weight, rmsnorm_weight, scales, sin, cos, q_proj_saved, k_proj_saved = ctx.saved_tensors
+    sin = _ensure_4d(sin)
+    cos = _ensure_4d(cos)
     
     B = int(q_proj_saved.shape[0])
     num_heads = int(q_proj_saved.shape[1])
     N = int(q_proj_saved.shape[2])
     head_dim = int(q_proj_saved.shape[3])
-    
-    # Pre-allocate epilogue backward outputs
-    dq_before = torch.empty_like(q_proj_saved)
-    dk_before = torch.empty_like(k_proj_saved)
-    grad_rmsnorm_weight = torch.zeros((2, 1, head_dim), device=q_proj_saved.device, dtype=torch.float32)
-    grad_scales = torch.zeros((num_heads, 1, 1), device=q_proj_saved.device, dtype=torch.float32)
-    
-    # 1. Execute raw epilogue backward kernel
     shape_key = (B, N)
-    back_epi_kernel = _epilogue_bwd_kernel_cache.get(shape_key)
-    if back_epi_kernel is None:
-        config = get_autotuned_config(M=N, N=num_heads, K=head_dim, is_fused="epilogue_bwd")
-        BLOCK_M = config["BLOCK_M"]
-        HEAD_GROUP = config["HEAD_GROUP"]
-        ab_stage = config["ab_stage"]
-        num_warps = config.get("num_warps", 4)
-        maxrregcount = config.get("maxrregcount", 255)
-        
-        q_strides = q_proj_saved.stride()
-        k_strides = k_proj_saved.stride()
-        sin_strides = sin.stride()
-        cos_strides = cos.stride()
-        
-        back_epi_kernel = get_fused_epilogue_back_kernel(
-            num_warps=num_warps,
-            BLOCK_M=BLOCK_M,
-            NUM_HEADS=num_heads,
-            HEAD_DIM=head_dim,
-            HEAD_GROUP=HEAD_GROUP,
-            ab_stage=ab_stage,
-            q_strides=q_strides,
-            k_strides=k_strides,
-            sin_strides=sin_strides,
-            cos_strides=cos_strides,
-            maxrregcount=maxrregcount
-        )
-        _epilogue_bwd_kernel_cache[shape_key] = back_epi_kernel
-        
-    rmsnorm_weight_32 = rmsnorm_weight if rmsnorm_weight.dtype == torch.float32 and rmsnorm_weight.is_contiguous() else rmsnorm_weight.to(torch.float32).contiguous()
-    scales_32 = scales if scales.dtype == torch.float32 and scales.is_contiguous() else scales.to(torch.float32).contiguous()
-    sin_32 = sin if sin.dtype == torch.float32 and sin.is_contiguous() else sin.to(torch.float32).contiguous()
-    cos_32 = cos if cos.dtype == torch.float32 and cos.is_contiguous() else cos.to(torch.float32).contiguous()
     
-    back_epi_kernel(
-        q_proj_saved, k_proj_saved, rmsnorm_weight_32, scales_32, sin_32, cos_32,
-        grad_q, grad_k, dq_before, dk_before,
-        grad_rmsnorm_weight, grad_scales
+    # 1. Execute epilogue backward via registered custom op (essential for torch.compile tracing)
+    dq_before, dk_before, grad_rmsnorm_weight, grad_scales = torch.ops.flash_prologue.qknorm_rope_scale_cute_backward(
+        q_proj_saved, k_proj_saved, rmsnorm_weight, scales, sin, cos, grad_q, grad_k
+    )
+    # 2. Execute projection backward via registered custom op (essential for torch.compile tracing)
+    grad_x, grad_weight = torch.ops.flash_prologue.fused_qkv_backward(
+        dq_before, dk_before, grad_v, weight, x
     )
     
-    # 2. Execute raw matmul_bwd_dx kernel
-    M_dim_dx = B * N
-    K_dim_dx = 3 * num_heads * head_dim
-    N_dim = int(weight.shape[1])
-    
-    grad_x = torch.empty((B, N, N_dim), dtype=torch.bfloat16, device=grad_q.device)
-    
-    static_stride_h = N * head_dim
-    static_stride_n = head_dim
-    static_stride_d = 1
-    static_strides = (None, static_stride_h, static_stride_n, static_stride_d)
-    
-    dx_kernel = _bwd_dx_kernel_cache.get(shape_key)
-    if dx_kernel is None:
-        config_dx = get_autotuned_config(M_dim_dx, N_dim, K_dim_dx, "bwd_dx", device=str(grad_q.device))
-        
-        dx_kernel = get_matmul_bwd_dx_kernel(
-            num_warps=config_dx.get("num_warps", 4),
-            BLOCK_M=config_dx["BLOCK_M"],
-            BLOCK_N=config_dx["BLOCK_N"],
-            BLOCK_K_STAGE=config_dx["BLOCK_K"],
-            ab_stage=config_dx.get("ab_stage", 2),
-            B=B,
-            N=N,
-            K_dim=K_dim_dx,
-            N_dim=N_dim,
-            NUM_HEADS=num_heads,
-            HEAD_DIM=head_dim,
-            q_strides=static_strides,
-            k_strides=static_strides,
-            v_strides=static_strides,
-            maxrregcount=config_dx.get("maxrregcount", 255),
-            swizzle_x=config_dx.get("swizzle_x", 8)
-        )
-        _bwd_dx_kernel_cache[shape_key] = dx_kernel
-        
-    dx_kernel(dq_before, dk_before, grad_v, weight, grad_x.view(M_dim_dx, N_dim))
-    
-    # 3. Execute raw matmul_bwd_dw kernel
-    M_dim_dw = 3 * num_heads * head_dim
-    K_dim_dw = B * N
-    
-    shape_key_dw = (B, N, False)
-    cached_dw = _bwd_dw_kernel_cache.get(shape_key_dw)
-    if cached_dw is None:
-        config_dw = get_autotuned_config(M_dim_dw, N_dim, K_dim_dw, "bwd_dw", device=str(grad_q.device))
-        split_k = config_dw.get("SPLIT_K", 1)
-        
-        dw_kernel = get_matmul_bwd_dw_kernel(
-            num_warps=config_dw.get("num_warps", 4),
-            BLOCK_M=config_dw["BLOCK_M"],
-            BLOCK_N=config_dw["BLOCK_N"],
-            BLOCK_K_STAGE=config_dw["BLOCK_K"],
-            ab_stage=config_dw.get("ab_stage", 2),
-            B=B,
-            N=N,
-            M_dim=M_dim_dw,
-            K_dim=K_dim_dw,
-            N_dim=N_dim,
-            NUM_HEADS=num_heads,
-            HEAD_DIM=head_dim,
-            q_strides=static_strides,
-            k_strides=static_strides,
-            v_strides=static_strides,
-            maxrregcount=config_dw.get("maxrregcount", 255),
-            SPLIT_K=split_k,
-            swizzle_x=config_dw.get("swizzle_x", 8)
-        )
-        _bwd_dw_cache_val = (dw_kernel, split_k)
-        _bwd_dw_kernel_cache[shape_key_dw] = _bwd_dw_cache_val
-    else:
-        dw_kernel, split_k = cached_dw
-        
-    grad_weight = torch.empty((M_dim_dw, N_dim), dtype=torch.bfloat16, device=grad_q.device)
-    x_flat = x.view(K_dim_dw, N_dim)
-    
-    if split_k > 1:
-        workspace = get_workspace_tensor((split_k, M_dim_dw, N_dim), dtype=torch.float32, device=grad_q.device)
-        workspace_flat = workspace.view(split_k * M_dim_dw, N_dim)
-        dw_kernel(dq_before, dk_before, grad_v, x_flat, workspace_flat)
-        
-        reduction_kernel = get_reduction_kernel(M_dim_dw, N_dim, split_k)
-        reduction_kernel(workspace, grad_weight)
-    else:
-        dw_kernel(dq_before, dk_before, grad_v, x_flat, grad_weight)
-        
     return grad_x, grad_weight, grad_rmsnorm_weight, grad_scales, None, None
 
 def _fused_qkv_epilogue_setup_context(ctx, inputs, output):
@@ -961,6 +874,8 @@ def fused_qkv_epilogue_ckp_op(
     sin: torch.Tensor,
     cos: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    sin = _ensure_4d(sin)
+    cos = _ensure_4d(cos)
     x = _ensure_contiguous(x)
     weight = _ensure_contiguous(weight)
     
@@ -1022,7 +937,21 @@ def fused_qkv_epilogue_ckp_op(
     k_final.copy_(k_proj_bf16)
     
     # 2. Epilogue (in-place on q_final and k_final)
-    fwd_epi_kernel = _epilogue_fwd_kernel_cache.get(shape_key)
+    q_strides = q_final.stride()
+    k_strides = k_final.stride()
+    
+    sin_c = sin if sin.is_contiguous() else sin.contiguous()
+    cos_c = cos if cos.is_contiguous() else cos.contiguous()
+    sin_strides = sin_c.stride()
+    cos_strides = cos_c.stride()
+    
+    cache_key = (
+        B, N, num_heads, head_dim,
+        q_strides, k_strides, sin_strides, cos_strides,
+        tuple(sin_c.shape), tuple(cos_c.shape),
+        q_final.dtype, k_final.dtype, rmsnorm_weight.dtype, scales.dtype, sin_c.dtype, cos_c.dtype
+    )
+    fwd_epi_kernel = _epilogue_fwd_kernel_cache.get(cache_key)
     if fwd_epi_kernel is None:
         config = get_autotuned_config(M=N, N=num_heads, K=head_dim, is_fused="epilogue_fwd")
         BLOCK_M = config["BLOCK_M"]
@@ -1031,11 +960,6 @@ def fused_qkv_epilogue_ckp_op(
         num_warps = config.get("num_warps", 4)
         maxrregcount = config.get("maxrregcount", 255)
         
-        q_strides = q_final.stride()
-        k_strides = k_final.stride()
-        sin_strides = sin.stride()
-        cos_strides = cos.stride()
-        
         fwd_epi_kernel = get_fused_epilogue_kernel(
             num_warps=num_warps,
             BLOCK_M=BLOCK_M,
@@ -1043,21 +967,31 @@ def fused_qkv_epilogue_ckp_op(
             HEAD_DIM=head_dim,
             HEAD_GROUP=HEAD_GROUP,
             ab_stage=ab_stage,
-            q_strides=q_strides,
-            k_strides=k_strides,
+            q_in_strides=q_strides,
+            k_in_strides=k_strides,
+            q_out_strides=q_strides,
+            k_out_strides=k_strides,
             sin_strides=sin_strides,
             cos_strides=cos_strides,
-            maxrregcount=maxrregcount
+            maxrregcount=maxrregcount,
+            B=B,
+            N=N,
+            sin_shape=tuple(sin_c.shape),
+            cos_shape=tuple(cos_c.shape),
+            q_dtype=q_final.dtype,
+            k_dtype=k_final.dtype,
+            weight_dtype=rmsnorm_weight.dtype,
+            scales_dtype=scales.dtype,
+            sin_dtype=sin_c.dtype,
+            cos_dtype=cos_c.dtype
         )
-        _epilogue_fwd_kernel_cache[shape_key] = fwd_epi_kernel
+        _epilogue_fwd_kernel_cache[cache_key] = fwd_epi_kernel
         
-    rmsnorm_weight_32 = rmsnorm_weight if rmsnorm_weight.dtype == torch.float32 and rmsnorm_weight.is_contiguous() else rmsnorm_weight.to(torch.float32).contiguous()
-    scales_32 = scales if scales.dtype == torch.float32 and scales.is_contiguous() else scales.to(torch.float32).contiguous()
-    sin_32 = sin if sin.dtype == torch.float32 and sin.is_contiguous() else sin.to(torch.float32).contiguous()
-    cos_32 = cos if cos.dtype == torch.float32 and cos.is_contiguous() else cos.to(torch.float32).contiguous()
+    rmsnorm_weight_c = rmsnorm_weight if rmsnorm_weight.is_contiguous() else rmsnorm_weight.contiguous()
+    scales_c = scales if scales.is_contiguous() else scales.contiguous()
     
     fwd_epi_kernel(
-        q_final, k_final, rmsnorm_weight_32, scales_32, sin_32, cos_32
+        q_final, k_final, q_final, k_final, rmsnorm_weight_c, scales_c, sin_c, cos_c
     )
     return q_final, k_final, v_proj_bf16
 

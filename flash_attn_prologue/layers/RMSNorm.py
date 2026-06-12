@@ -133,3 +133,31 @@ class RMSNorm2d(nn.Module):
         if self.weight is not None:
             return output * self.weight
         return output
+
+
+class RMSNormRoPEScale(nn.Module):
+    """
+    Fused epilogue layer implementing QK normalization, RoPE, and scaling in a single JIT operator.
+    Stores weights and scales in BFloat16 and takes split Q and K.
+    """
+    def __init__(self, num_heads: int, head_dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.eps = eps
+        
+        # Store weights and scales as BFloat16 parameters
+        self.rmsnorm_weight = nn.Parameter(torch.ones(2, 1, head_dim, dtype=torch.bfloat16))
+        self.scales = nn.Parameter(torch.empty(num_heads, 1, 1, dtype=torch.bfloat16))
+        self.reset_parameters()
+        
+    def reset_parameters(self) -> None:
+        import math
+        nn.init.constant_(self.rmsnorm_weight, 1.0)
+        nn.init.constant_(self.scales, math.log(self.head_dim ** -0.5))
+        
+    def forward(self, q: Tensor, k: Tensor, sin: Tensor, cos: Tensor) -> Tuple[Tensor, Tensor]:
+        return torch.ops.flash_prologue.qknorm_rope_scale_cute(
+            q, k, self.rmsnorm_weight, self.scales, sin, cos, self.eps
+        )
+
