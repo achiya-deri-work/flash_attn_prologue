@@ -19,6 +19,7 @@ This project contains a high-performance custom CUDA kernel implementation for a
 - **Inverse Epilogue Operator (Activation Recomputation):** Standalone memory-efficient inverse epilogue operator (`qknorm_rope_scale_cute_inverse_op`) that reconstructs the forward inputs $Q$ and $K$ on-chip in registers during the backward pass using the forward outputs and low-overhead scale factors (`rms_q`, `rms_k`), eliminating input VRAM storage and saving 64x activation memory.
 - **torch.compile Integration:** Fully compatible with `torch.compile` via custom PyTorch operator registration and custom schema definitions.
 - **Temporal Mamba 3 Scan Kernels:** Coordinate-descent autotuned forward and backward scan kernels using the CuTe Python DSL. Features independent FWD/BWD profiling and caching, a hybrid search algorithm (wide grid search followed by deep coordinate descent), warp-shuffle elimination via shared memory broadcasts in the backward pass, and advanced performance optimizations (two-pass parameter gradient workspace reduction to eliminate global atomic collisions, compile-time AST rank loop unrolling, and direct-to-global epilogue store for states to bypass 64KB SMEM writeback buffers), achieving 100% correctness parity and up to **2.08x speedup** (FWD+BWD) vs PyTorch Inductor.
+- **Cloned RoPE Self-Attention & Mamba-3 Single Step Update Compilation Parity:** Tests the cloned modules from `Advantage-First-RL` under `torch.compile(fullgraph=True)` with fixes for stride-based positional broadcasting (zero-stride batching) and protection against Inductor-reused gradient buffer garbage in the padded region.
 
 ## Installation
 
@@ -35,6 +36,11 @@ pip install -e .
 ## Running Tests and Benchmarks
 
 Verify correctness of the package with active tests (no extra environment variables required):
+
+- **Verify the compilation parity and numerical correctness of Cloned RoPE Attention and Mamba-3 Single Step Update modules**:
+  ```bash
+  pytest tests/test_rope_mamba_compile.py
+  ```
 
 - **Verify the cloned and adapted TMA-based backward GEMM kernels (`matmul_bwd_dx` and `matmul_bwd_dw`)**:
   ```bash

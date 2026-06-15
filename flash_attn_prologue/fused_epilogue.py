@@ -615,6 +615,11 @@ def get_fused_epilogue_kernel(
     else:
         cos_shape = tuple(cos_shape)
         
+    if sin_shape[0] == 1:
+        sin_strides = (0, sin_strides[1], sin_strides[2], sin_strides[3])
+    if cos_shape[0] == 1:
+        cos_strides = (0, cos_strides[1], cos_strides[2], cos_strides[3])
+        
     key = (
         B, N, num_warps, BLOCK_M, NUM_HEADS, HEAD_DIM, HEAD_GROUP, ab_stage,
         q_in_strides, k_in_strides, q_out_strides, k_out_strides, sin_strides, cos_strides, maxrregcount, sin_shape, cos_shape,
@@ -787,6 +792,10 @@ def qknorm_rope_scale_cute_op(
         sys.stderr.write(f"cos shape: {cos_c.shape}, stride: {cos_c.stride()}, dtype: {cos_c.dtype}\n")
         sys.stderr.flush()
         raise e
+    # Preserve input lifetimes to prevent eager allocator from reusing memory while FFI kernel runs
+    inputs_tuple = (q, k, rmsnorm_weight_c, scales_c, sin_c, cos_c)
+    q_out._base_inputs = inputs_tuple
+    k_out._base_inputs = inputs_tuple
     return q_out, k_out
 
 @qknorm_rope_scale_cute_op.register_fake
@@ -1213,6 +1222,11 @@ def get_fused_epilogue_back_kernel(
     else:
         cos_shape = tuple(cos_shape)
         
+    if sin_shape[0] == 1:
+        sin_strides = (0, sin_strides[1], sin_strides[2], sin_strides[3])
+    if cos_shape[0] == 1:
+        cos_strides = (0, cos_strides[1], cos_strides[2], cos_strides[3])
+        
     key = (
         B, N, num_warps, BLOCK_M, NUM_HEADS, HEAD_DIM, HEAD_GROUP, ab_stage,
         q_strides, k_strides, sin_strides, cos_strides, maxrregcount, sin_shape, cos_shape,
@@ -1285,21 +1299,32 @@ def qknorm_rope_scale_cute_backward_op(
     num_heads = int(q.shape[1])
     N = int(q.shape[2])
     head_dim = int(q.shape[3])
-    
     q_strides_compact = _get_compact_strides(q.shape, q.stride())
     k_strides_compact = _get_compact_strides(k.shape, k.stride())
-    
+
+
     q_matched = q if q.stride() == q_strides_compact else torch.empty_strided(q.shape, q_strides_compact, dtype=q.dtype, device=q.device).copy_(q)
     k_matched = k if k.stride() == k_strides_compact else torch.empty_strided(k.shape, k_strides_compact, dtype=k.dtype, device=k.device).copy_(k)
     
     grad_q_out_matched = grad_q_out if grad_q_out.stride() == q_strides_compact else torch.empty_strided(q.shape, q_strides_compact, dtype=grad_q_out.dtype, device=grad_q_out.device).copy_(grad_q_out)
     grad_k_out_matched = grad_k_out if grad_k_out.stride() == k_strides_compact else torch.empty_strided(k.shape, k_strides_compact, dtype=grad_k_out.dtype, device=grad_k_out.device).copy_(grad_k_out)
-    
+
+    # Zero out potential garbage in the padded region of grad_q_out/grad_k_out
+    active_mask = (cos.abs().sum(dim=(0, 1, 3)) > 1e-6).to(dtype=grad_q_out_matched.dtype, device=grad_q_out_matched.device)
+    active_mask_4d = active_mask.view(1, 1, -1, 1)
+    grad_q_out_matched = grad_q_out_matched * active_mask_4d
+    grad_k_out_matched = grad_k_out_matched * active_mask_4d
+
+    rmsnorm_weight_c = rmsnorm_weight if rmsnorm_weight.is_contiguous() else rmsnorm_weight.contiguous()
+    scales_c = scales if scales.is_contiguous() else scales.contiguous()
+    sin_c = sin if sin.is_contiguous() else sin.contiguous()
+    cos_c = cos if cos.is_contiguous() else cos.contiguous()
+
+
+
     q_strides = tuple(int(s) for s in q_strides_compact)
     k_strides = tuple(int(s) for s in k_strides_compact)
     
-    sin_c = sin if sin.is_contiguous() else sin.contiguous()
-    cos_c = cos if cos.is_contiguous() else cos.contiguous()
     sin_strides = tuple(int(s) for s in sin_c.stride())
     cos_strides = tuple(int(s) for s in cos_c.stride())
     
@@ -1351,12 +1376,22 @@ def qknorm_rope_scale_cute_backward_op(
     rmsnorm_weight_c = rmsnorm_weight if rmsnorm_weight.is_contiguous() else rmsnorm_weight.contiguous()
     scales_c = scales if scales.is_contiguous() else scales.contiguous()
     
+
+    
     back_kernel(
         q_matched, k_matched, rmsnorm_weight_c, scales_c, sin_c, cos_c,
         grad_q_out_matched, grad_k_out_matched, grad_q, grad_k,
         grad_rmsnorm_weight, grad_scales
     )
     
+
+    
+    # Preserve input lifetimes to prevent eager allocator from reusing memory while FFI kernel runs
+    inputs_tuple = (q_matched, k_matched, rmsnorm_weight_c, scales_c, sin_c, cos_c, grad_q_out_matched, grad_k_out_matched)
+    grad_q._base_inputs = inputs_tuple
+    grad_k._base_inputs = inputs_tuple
+    grad_rmsnorm_weight._base_inputs = inputs_tuple
+    grad_scales._base_inputs = inputs_tuple
     return grad_q, grad_k, grad_rmsnorm_weight, grad_scales
 
 @qknorm_rope_scale_cute_backward_op.register_fake
@@ -2334,6 +2369,11 @@ def get_fused_epilogue_inverse_kernel(
     else:
         cos_shape = tuple(cos_shape)
         
+    if sin_shape[0] == 1:
+        sin_strides = (0, sin_strides[1], sin_strides[2], sin_strides[3])
+    if cos_shape[0] == 1:
+        cos_strides = (0, cos_strides[1], cos_strides[2], cos_strides[3])
+        
     key = (
         B, N, num_warps, BLOCK_M, NUM_HEADS, HEAD_DIM, HEAD_GROUP, ab_stage,
         q_in_strides, k_in_strides, q_out_strides, k_out_strides, sin_strides, cos_strides, maxrregcount, sin_shape, cos_shape,
@@ -2421,6 +2461,11 @@ def get_fused_epilogue_inverse_back_kernel(
         cos_shape = (B_sym, 1, N_sym, HEAD_DIM // 2)
     else:
         cos_shape = tuple(cos_shape)
+        
+    if sin_shape[0] == 1:
+        sin_strides = (0, sin_strides[1], sin_strides[2], sin_strides[3])
+    if cos_shape[0] == 1:
+        cos_strides = (0, cos_strides[1], cos_strides[2], cos_strides[3])
         
     key = (
         B, N, num_warps, BLOCK_M, NUM_HEADS, HEAD_DIM, HEAD_GROUP, ab_stage,
@@ -2567,6 +2612,12 @@ def qknorm_rope_scale_cute_inverse_op(
     fwd_kernel(
         q, k, q_out, k_out, rmsnorm_weight_c, scales_c, sin_c, cos_c, rms_q, rms_k
     )
+    # Preserve input lifetimes to prevent eager allocator from reusing memory while FFI kernel runs
+    inputs_tuple = (q, k, rmsnorm_weight_c, scales_c, sin_c, cos_c)
+    q_out._base_inputs = inputs_tuple
+    k_out._base_inputs = inputs_tuple
+    rms_q._base_inputs = inputs_tuple
+    rms_k._base_inputs = inputs_tuple
     return q_out, k_out, rms_q, rms_k
 
 @qknorm_rope_scale_cute_inverse_op.register_fake
@@ -2614,6 +2665,12 @@ def qknorm_rope_scale_cute_inverse_backward_op(
     
     grad_q_out_matched = grad_q_out if grad_q_out.stride() == q_strides_compact else torch.empty_strided(q_out.shape, q_strides_compact, dtype=grad_q_out.dtype, device=grad_q_out.device).copy_(grad_q_out)
     grad_k_out_matched = grad_k_out if grad_k_out.stride() == k_strides_compact else torch.empty_strided(k_out.shape, k_strides_compact, dtype=grad_k_out.dtype, device=grad_k_out.device).copy_(grad_k_out)
+
+    # Zero out potential garbage in the padded region of grad_q_out/grad_k_out
+    active_mask = (cos.abs().sum(dim=(0, 1, 3)) > 1e-6).to(dtype=grad_q_out_matched.dtype, device=grad_q_out_matched.device)
+    active_mask_4d = active_mask.view(1, 1, -1, 1)
+    grad_q_out_matched = grad_q_out_matched * active_mask_4d
+    grad_k_out_matched = grad_k_out_matched * active_mask_4d
     
     q_strides = tuple(int(s) for s in q_strides_compact)
     k_strides = tuple(int(s) for s in k_strides_compact)
@@ -2680,6 +2737,12 @@ def qknorm_rope_scale_cute_inverse_backward_op(
         rms_q_c, rms_k_c
     )
     
+    # Preserve input lifetimes to prevent eager allocator from reusing memory while FFI kernel runs
+    inputs_tuple = (q_matched, k_matched, rmsnorm_weight_c, scales_c, sin_c, cos_c, grad_q_out_matched, grad_k_out_matched, rms_q_c, rms_k_c)
+    grad_q._base_inputs = inputs_tuple
+    grad_k._base_inputs = inputs_tuple
+    grad_rmsnorm_weight._base_inputs = inputs_tuple
+    grad_scales._base_inputs = inputs_tuple
     return grad_q, grad_k, grad_rmsnorm_weight, grad_scales
 
 @qknorm_rope_scale_cute_inverse_backward_op.register_fake

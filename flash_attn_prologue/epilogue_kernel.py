@@ -255,9 +255,15 @@ def qknorm_rope_scale_op(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # We call CuTe implementation in non-tracing modes on CUDA
     if qkv.device.type == "cuda":
-        return qknorm_rope_scale_cute(qkv, rmsnorm_weight, scales, sin, cos, eps)
+        q_proj, k_proj, v_proj = qknorm_rope_scale_cute(qkv, rmsnorm_weight, scales, sin, cos, eps)
     else:
-        return qknorm_rope_scale_eager(qkv, rmsnorm_weight, scales, sin, cos, eps)
+        q_proj, k_proj, v_proj = qknorm_rope_scale_eager(qkv, rmsnorm_weight, scales, sin, cos, eps)
+    # Preserve input lifetimes to prevent eager allocator from reusing memory while FFI kernel runs
+    inputs_tuple = (qkv, rmsnorm_weight, scales, sin, cos)
+    q_proj._base_inputs = inputs_tuple
+    k_proj._base_inputs = inputs_tuple
+    v_proj._base_inputs = inputs_tuple
+    return q_proj, k_proj, v_proj
 
 
 @qknorm_rope_scale_op.register_fake

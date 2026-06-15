@@ -447,3 +447,56 @@
     - **Unhashable Type List Fix**: Resolved `TypeError: unhashable type: 'list'` during compiled kernel retrieval by dynamically converting JSON-parsed lists in `copy_layout_shape` and `mma_shape` to tuples upon loading the cache and querying inside the custom operators.
     - **Synchronized Cache**: Successfully tuned the target shape `dstate=32, dhead=64, mimo_rank=4` (corresponding to cache keys `32_64_4_fwd` and `32_64_4_bwd`) and `64_32_4` (corresponding to keys `64_32_4_fwd` and `64_32_4_bwd`) using a two-stage autotune sweep (grid search + coordinate descent) and synchronized the caches and source code files between both `flash_attn_prologue` and `Advantage-First-RL` workspaces.
     - **Validation**: Verified that the entire training loop compiles cleanly under `fullgraph=True` in 4.94s (hitting the JIT compilation cache successfully), and all unit tests pass with correct numerical results.
+
+75. **Relocated Coordinate Descent Autotuner inside Module Folder (June 2026)**:
+    - **Self-contained Codebase**: Copied `coordinate_descent.py` from the external `CuTe_DSL_CONTEXT` into `advantage_first/layers/cute/coordinate_descent.py`.
+    - **Local Dependency Import**: Modified `advantage_first/layers/cute/autotuner.py` to import `CoordinateDescentAutotuner` locally from `.coordinate_descent` rather than referencing `CuTe_DSL_CONTEXT`, eliminating any external import requirements when running scratch scripts or tests.
+    - **Verification**: Verified that both `pytest tests/` and `scratch/test_mask_generator.py` execute successfully under the virtual environment.
+
+76. **Rectangular Contiguous Mask Generation for VJepaMaskGenerator (June 2026)**:
+    - **Chebyshev Distance Metric**: Replaced the Euclidean (L2) distance center penalty in `VJepaMaskGenerator` with Chebyshev (L-infinity) distance (`torch.maximum(torch.abs(dx) / W_half, torch.abs(dy) / H_half)`) to align the penalty contours with rectangular block boundaries.
+    - **Global Heatmap Scoring**: Eliminated the `in_block` binary masking. Instead, every pixel's score is computed as `scores - dist` globally and maximized over blocks. This forces the Top-K selection to grow contiguous rectangular shapes around the centers and completely eliminates scattered background noise.
+    - **L2 Tie-Breaker**: Added a tiny L2 distance component (`1e-4 * dist_l2`) as a tie-breaker. This resolves flat edge scores along the Chebyshev contours, forcing corner pixels to be dropped first and keeping mask boundaries solid and free of random gaps.
+    - **Validation**: Verified that the generated single-block and multi-block masks form solid, sharp, perfectly rectangular blocks and all unit tests pass.
+
+77. **Correction of Effective Rank Calculation (June 2026)**:
+    - **Removed Centering from SVD**: Identified that the logging metrics for `cross_episode_effective_rank` and `cross_token_effective_rank` in `advantage_first/logging/workers.py` were centering representation matrices before computing SVD.
+    - **Mathematical Issue**: Subtracting the mean vector removes the dominant alignment direction (rank-1 component). Consequently, even for perfectly collapsed features, SVD was run on isotropic numerical residual noise, producing an artificially high, flat effective rank (~28.9 out of 32) that completely failed to capture feature collapse.
+    - **Uncentered SVD Implementation**: Removed centering from both calculations, computing the SVD directly on the cosine-normalized representations. This correctly maps effective rank from 1.0 (complete collapse) up to the maximum dimension (uncorrelated), aligning it as a robust complement to average cosine similarity.
+
+78. **Profiling & Optimization of Large-Patch Logging Bottleneck (June 2026)**:
+    - **Active Logging Shape Profiling**: Profiled the shapes of logged tensors in both training (`bptt_step`) and evaluation (`eval_one_judge_epoch`) pipelines:
+      - `pred_patches`: `[8, Batch, 576, 1024]`
+      - `target_patches`: `[8, Batch, 576, 1024]`
+      - `target_mem_tp1` / `target_vis_tp1`: `[11, Batch, 64, 256]`
+      - `pred_mem_tp1` / `pred_vis_tp1`: `[8, Batch, 4, 64, 256]`
+      - `online_mem_t` / `online_vis_t` / `target_mem_t` / `target_vis_t`: `[Batch, 64, 256]`
+    - **Performance Bottleneck Diagnostics**:
+      - For sequence sequence length 8 and batch size 16, the unreduced `pred_patches` and `target_patches` are each ~302 MB (total ~604 MB).
+      - Transferring these large payloads over the process queues triggers extremely high IPC overhead.
+      - Furthermore, SVD on matrices of size $576 \times 1024$ on the CPU takes ~1.5s per step, causing the training loop to stall.
+    - **Vectorized Loss-Level Reductions**:
+      - Implemented vectorized GPU-side `min`/`max`/`mean`/`std` reductions inside `FusedLosses.forward` before the backward pass (non-overwriting, using native dtypes without `.float()` overhead).
+      - Reductions are computed on a stacked tensor `[6, BPTT_CHUNK_SIZE, Batch, 1]` containing `value_targets`, `td_targets[:, :, 0]`, `V_of_S_A.min(dim=2).values`, `V_of_S`, `rewards.unsqueeze(-1)`, and `Advantage`, and flattened to `[6, BPTT_CHUNK_SIZE * Batch]` for parallel reductions.
+      - Inverse dynamics categorical accuracy is also calculated directly on GPU. All metrics are returned in a `metrics_tensors` tuple.
+      - This completely removes the simple metrics payload and CPU-side parsing queues from the logging process.
+
+80. **Eliminated Redundant Loop-Level CPU Transfers & 21% Evaluation Speedup (June 2026)**:
+    - **Optimization**: Identified and removed redundant `.detach().to("cpu", non_blocking=True)` calls from the training (`train_one_judge_epoch`) and evaluation (`eval_one_judge_epoch`) loops.
+    - **Rationale**: Since the custom `FusedLosses` module was previously refactored to perform and return CPU-detached tensors directly (allowing PyTorch Inductor to schedule and optimize the asynchronous transfers within the compiled graph), performing these transfers again in the outer loops was completely redundant.
+    - **Results**: Removing these duplicate python-to-C++ FFI calls lowered CPU dispatch overhead significantly, decreasing evaluation step latency from **4.20s/it** down to **3.30s/it** (representing a **21% speedup** in evaluation throughput).
+
+81. **Reverted Loss-Level Logging Reductions and Backward Pass Relocation (June 2026)**:
+    - **Reversion of Logging Optimizations**: Undid the GPU-side metrics reductions (min/max/mean/std of targets, V-values, td_targets, advantage, inverse dynamics accuracy) and CPU detaches/moves inside the compiled `FusedLosses` module. Reverted to standard eager-mode `.detach().to("cpu")` offloading and on-the-fly metric logging inside the `train_one_judge_epoch` and `eval_one_judge_epoch` loops, restoring the SVD-based `heavy_metrics_tensors` logging.
+    - **Reversion of Backward Pass Movement**: Relocated the `.backward()` call back out of `FusedLosses` into the main `train_one_judge_epoch` loop, running backward on the scaled loss directly in eager mode as originally designed.
+
+82. **Coordinate Descent Autotuner Robustness Enhancement (June 2026)**:
+    - **Recursive Cache Hashing**: Implemented recursive translation of lists and dicts inside `_hash_config` into hashable tuples and sorted tuples of tuples in both `flash_attn_prologue/flash_attn_prologue/coordinate_descent.py` and `Advantage-First-RL/advantage_first/layers/cute/coordinate_descent.py`. This ensures that even if custom configs contain raw lists (e.g. `copy_layout_shape` or `mma_shape` from JSON/user definitions), the autotuner will not crash with `TypeError: unhashable type: 'list'`.
+    - **Unit Testing**: Added `test_unhashable_parameters` to `tests/test_coordinate_descent.py` to assert correct recursive translation of lists/dicts during parameter optimization. Verified that all unit tests pass successfully.
+
+83. **Cloning and Compile Parity Testing of RoPE Self-Attention & Mamba-3 Single Step Update Modules (June 2026)**:
+    - **Cloning & Testing**: Cloned the `FlashRoPESelfAttention` (as `ClonedFlashRoPESelfAttention`) and `Mamba3SingleStepUpdate` (as `ClonedMamba3SingleStepUpdate`) modules from `Advantage-First-RL` into `tests/test_rope_mamba_compile.py` to test their correctness under `torch.compile(fullgraph=True)`.
+    - **RoPE Stride Broadcasting Fix**: Discovered that when using shared positional `sin`/`cos` buffers (batch size 1), the FFI kernel's batch stride indexing caused out-of-bounds pointer offsets and memory corruption for `cta_b >= 1`. Fixed this by forcing batch strides of `sin` and `cos` to `0` when `sin_shape[0] == 1` in `fused_epilogue.py` to achieve zero-stride batch broadcasting.
+    - **Inductor Gradient Padding Garbage Protection**: Identified that PyTorch Inductor can leave uninitialized memory garbage in the padding region of gradient slices. In the backward pass, because the FFI kernel computes over the full sequence block size of 128, this garbage leaked into the gradients of `rmsnorm_weight` and `scales`. Resolved this by dynamically zero-masking `grad_q_out` and `grad_k_out` outside the active sequence region (detected using `cos.abs().sum(...) > 1e-6`) before calling the FFI kernel.
+    - **Verification**: Verified 100% correctness parity (outputs and gradients) under compilation with zero graph breaks, passing all tests.
+

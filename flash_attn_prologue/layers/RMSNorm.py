@@ -157,7 +157,22 @@ class RMSNormRoPEScale(nn.Module):
         nn.init.constant_(self.scales, math.log(self.head_dim ** -0.5))
         
     def forward(self, q: Tensor, k: Tensor, sin: Tensor, cos: Tensor) -> Tuple[Tensor, Tensor]:
-        return torch.ops.flash_prologue.qknorm_rope_scale_cute(
-            q, k, self.rmsnorm_weight, self.scales, sin, cos, self.eps
-        )
+        N = q.shape[2]
+        if N % 128 != 0:
+            pad_len = 128 - (N % 128)
+            import torch.nn.functional as F
+            q_padded = F.pad(q, (0, 0, 0, pad_len))
+            k_padded = F.pad(k, (0, 0, 0, pad_len))
+            sin_padded = F.pad(sin, (0, 0, 0, pad_len))
+            cos_padded = F.pad(cos, (0, 0, 0, pad_len))
+            
+            q_out_padded, k_out_padded = torch.ops.flash_prologue.qknorm_rope_scale_cute(
+                q_padded, k_padded, self.rmsnorm_weight, self.scales, sin_padded, cos_padded, self.eps
+            )
+            return q_out_padded[:, :, :N, :], k_out_padded[:, :, :N, :]
+        else:
+            return torch.ops.flash_prologue.qknorm_rope_scale_cute(
+                q, k, self.rmsnorm_weight, self.scales, sin, cos, self.eps
+            )
+
 

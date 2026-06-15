@@ -41,6 +41,8 @@ The project is structured as a modular Python library with clear separation betw
     - **On-Chip Register Upcasting**: Pass parameters (weights, scales, sin/cos tables) directly in their native dtypes (e.g. `BFloat16`), avoiding host-side `.to(torch.float32)` casting overhead. Loads parameters into registers in their native dtypes to match memory widths for `autovec_copy` and performs dynamic register-level upcasting to `Float32` in compute loops.
     - Specialized on input strides at JIT compile time, allowing it to execute directly on permuted non-contiguous view slices at zero runtime cost without PyTorch contiguous conversions.
     - Applies Float32 Q/K RMSNorm, on-the-fly RoPE rotations using half-dimension precomputed `sin`/`cos` buffers of shape `[..., dhead // 2]` loaded directly once to registers and reused twice on-chip, and query scaling.
+    - **Stride-Based Batch Broadcasting of RoPE Buffers**: Supports batch dimension broadcasting for RoPE buffers (`sin` and `cos`). When the batch dimension of positional embeddings is 1 (e.g. shape `[1, 1, seq, dhead/2]`), their batch strides are forced to `0` in the JIT compiler to prevent out-of-bounds memory accesses for `cta_b >= 1` and ensure correct broadcasting across all batches.
+    - **Uninitialized Gradient Padding Garbage Protection**: Eliminates parameter gradient corruption in compiled mode. Because PyTorch Inductor may reuse buffers with random garbage in the padded region (elements 64 to 128), and the FFI backward kernel computes on full block boundaries (128 elements), this garbage would propagate into parameter gradients (`rmsnorm_weight` and `scales`). To prevent this, active mask detection (`cos.abs().sum(dim=(0, 1, 3)) > 1e-6`) is used to zero out `grad_q_out` and `grad_k_out` outside the active sequence boundaries before running the JIT kernel.
     - Padded shared memory strides and block-level validation filters to eliminate LDS bank conflicts and block-level loops.
     - Maps the sequence dimension directly to the grid blocks to process exactly one tile of size 64 per CTA (loopless design), achieving a 2.33x speedup over Triton on non-contiguous slices.
     - Exposes `qknorm_rope_scale_cute_op` and `qknorm_rope_scale_cute_backward_op` via `flash_attn_prologue/__init__.py`, registering them as custom PyTorch operators under `flash_prologue::qknorm_rope_scale_cute` and `flash_prologue::qknorm_rope_scale_cute_backward` with independent autotuning.
@@ -63,12 +65,15 @@ The project is structured as a modular Python library with clear separation betw
       - `bwd_dx` (shape 16384_512_3072): `BLOCK_M = 64, BLOCK_N = 64, BLOCK_K = 16, ab_stage = 3, num_warps = 4, maxrregcount = 80, swizzle_x = 16, atom_layout_mnk = [1, 4, 1]`.
       - `bwd_dw` (shape 3072_512_16384): `BLOCK_M = 64, BLOCK_N = 64, BLOCK_K = 16, ab_stage = 3, num_warps = 4, maxrregcount = 255, SPLIT_K = 12, swizzle_x = 8, atom_layout_mnk = (4, 1, 1)`.
     - **Nested Incremental Counter Loop Optimization**: Eliminated dynamic division and modulo instructions in `GemmBwdDwCute.kernel`'s main loop by refactoring coordinate tracking (`b` and `n_tile`) into registers updated via simple addition and conditional reset steps. Reverted `GemmBwdDxCute.kernel` to `constexpr` unrolling to preserve constant-folding benefits, achieving a 4.0% standalone execution speedup on `dw_kernel`.
-12. **Coordinate Descent Autotuner (`flash_attn_prologue/coordinate_descent.py`):**
+12. **Coordinate Descent Autotuner (`advantage_first/layers/cute/coordinate_descent.py`):**
     - Implements the generic, dynamic `CoordinateDescentAutotuner` class used to tune hyperparameters such as block sizes, stages, warp layouts, and registers.
     - Supports dynamic parameter candidate generation of different step types (`power_of_2`, `step_1`, `both`, `maxrregcount`) as well as static list specifications.
     - Implements a greedy local coordinate walk to rapidly optimize parameters individually while maintaining backward compatibility with static grids.
+13. **Asynchronous Multi-process Logging Pipeline (`advantage_first/logging/workers.py`):**
+    - Decouples the training loops from logging and heavy computational profiling via multi-process isolation:
+      - `ScalarLogWorker` (Wandb Interface): Manages active connection handles to Weights & Biases on a background process, ensuring FFI network and HTTP request latencies do not block local training execution.
+      - `HeavyMetricsWorker` (CPU Math Profiling): Executes CPU-bound matrix mathematics, including Norm statistics, Cosine collapse ratios, and SVD Entropy-based Effective Rank calculations for all active model state layers.
 
----
 
 ## Pipeline & Data Flow
 
@@ -336,6 +341,8 @@ graph TD
 - **torch.compile Compatibility**: The module is fully traced and optimized by PyTorch Inductor. Its compatibility is validated with `fullgraph=True`, ensuring no Python-to-C++ or custom operator boundary graph breaks in both the forward execution and autograd backward paths.
 - **Layout Shape-Stride Specialization Alignment**: To guarantee that layouts can be specialized for any custom permuted strides (e.g. for non-contiguous views from unbind/split slices) without layout structure mismatches, both shapes and strides are dynamically cast to concrete Python integers in the operator wrappers. This allows the TVM/CuTe JIT compilation pipeline to construct layout types with consistent compile-time concrete shape dimensions and stride dimensions.
 - **Inductor Compact Stride Policy**: To prevent stride mismatch assertions during layout propagation under PyTorch Inductor, the custom operator outputs are allocated with compact strides matching the contiguous-by-permutation order of the inputs. Any inputs with non-contiguous strides are copied to compact tensors on FFI boundaries (specifically in the backward pass) so that the JIT compiled layouts and actual runtime layouts are perfectly matched.
+- **Stride-Based Batch Broadcasting of RoPE Buffers**: When `sin`/`cos` buffers are shared across the batch (batch dimension = 1), their batch strides are forced to `0` in the FFI kernel builders. This prevents pointer indexing out of bounds for batch indices `cta_b >= 1` (where the original batch stride would point to uninitialized memory) and correctly broadcasts the positional embeddings.
+- **Uninitialized Gradient Padding Garbage Protection**: Under PyTorch Inductor compilation, gradient buffers allocated for sliced sequences may contain uninitialized garbage in the padding region (e.g. sequence indices 64 to 128). Because the FFI custom operator evaluates over the full sequence blocks (128 elements), this garbage is incorporated into parameter gradient accumulations, corrupting the weights of `rmsnorm_weight` and `scales`. We resolve this by computing an active sequence mask (`cos.abs().sum(dim=(0, 1, 3)) > 1e-6`) and zeroing out the padding region of `grad_q_out_matched` and `grad_k_out_matched` prior to calling the FFI backward kernel.
 
 ### 15. Temporal Mamba 3 FWD/BWD CuTe Kernels
 - **Grid Mapping & Thread Block Tiling**:
@@ -365,16 +372,9 @@ graph TD
   - **Direct-to-Global Epilogue Store for States**: Staged buffers in shared memory (`smem_tile_state` and `smem_tile_trap` of size 64 KB) are completely bypassed in the backward pass. The active registers `dssm_state_local` and `dtrap_mem_local` are written directly to global memory. This reduces the block SMEM footprint to under 8 KB, boosting SM block occupancy on Blackwell SM120.
   - **On-Chip 3D-to-4D Logical Layout Mapping**: To avoid wrapper-level PyTorch `.view()` or `.reshape()` operations that incur compilation tracing overhead, the forward and backward kernels accept 3D tensors of shape `[B, S, H * P]` and logically map them to 4D views of shape `[B, S, H, P]` using CuTe's native layout mapping stride arithmetic. The custom operator interfaces receive and return 3D tensors directly, aligning the calling boundary with the physical memory layout of the model.
 
-
-
-
-
-
-
-
-
-
-
+### 16. Dynamic Evaluation RoPE Theta Alignment
+- **Dynamic Batch Sizing**: During the evaluation phase (`eval_one_judge_epoch`), validation batch sizes can vary (e.g., the last batch of the epoch). Generating standard RoPE phase arrays using a static `loader.batch_size` outside the loop caused mismatched dimensions inside the attention layers.
+- **Dynamic Resolution**: Moved the call to `generate_all_thetas` inside the validation loop, querying the batch size dynamically from `batch_data['images'].shape[1]` at each step. This enforces strict dimension matching across all evaluation batch boundaries and eliminates out-of-bounds page faults or shape crashes, maintaining identical logic to the training pipeline.
 
 
 

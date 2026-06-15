@@ -257,5 +257,66 @@
         "num_warps": 4,
         "maxrregcount": 128,
         "atom_layout_mnk": null
+    },
+    "1024_768_256_fused_qkv": {
+        "HEAD_GROUP": 1,
+        "BLOCK_M": 32,
+        "BLOCK_K": 64,
+        "ab_stage": 3,
+        "num_warps": 2,
+        "maxrregcount": 255,
+        "swizzle_x": 1,
+        "atom_layout_mnk": [
+            1,
+            2,
+            1
+        ]
+    },
+    "64_4_64_epilogue_fwd": {
+        "HEAD_GROUP": 1,
+        "BLOCK_M": 32,
+        "BLOCK_K": 64,
+        "ab_stage": 1,
+        "num_warps": 4,
+        "maxrregcount": 255,
+        "atom_layout_mnk": null
+    },
+    "64_4_64_epilogue_bwd": {
+        "HEAD_GROUP": 1,
+        "BLOCK_M": 64,
+        "BLOCK_K": 64,
+        "ab_stage": 1,
+        "num_warps": 2,
+        "maxrregcount": 255,
+        "atom_layout_mnk": null
+    },
+    "1024_256_768_bwd_dx": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 128,
+        "BLOCK_K": 16,
+        "ab_stage": 3,
+        "num_warps": 4,
+        "maxrregcount": 255,
+        "swizzle_x": 8,
+        "atom_layout_mnk": [
+            1,
+            4,
+            1
+        ]
+    },
+    "768_256_1024_bwd_dw": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 64,
+        "BLOCK_K": 64,
+        "ab_stage": 4,
+        "num_warps": 2,
+        "maxrregcount": 128,
+        "SPLIT_K": 2,
+        "swizzle_x": 8,
+        "atom_layout_mnk": [
+            1,
+            2,
+            1
+        ]
     }
 }

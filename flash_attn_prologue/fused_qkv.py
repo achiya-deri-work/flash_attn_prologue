@@ -654,6 +654,11 @@ def fused_qkv_op(
         q_proj_bf16, k_proj_bf16, v_proj_bf16
     )
     
+    # Preserve input lifetimes to prevent eager allocator from reusing memory while FFI kernel runs
+    inputs_tuple = (x, weight_q, weight_k, weight_v)
+    q_proj_bf16._base_inputs = inputs_tuple
+    k_proj_bf16._base_inputs = inputs_tuple
+    v_proj_bf16._base_inputs = inputs_tuple
     return q_proj_bf16, k_proj_bf16, v_proj_bf16
 
 @fused_qkv_op.register_fake
@@ -818,6 +823,13 @@ def fused_qkv_epilogue_op(
     fwd_epi_kernel(
         q_final, k_final, q_final, k_final, rmsnorm_weight_c, scales_c, sin_c, cos_c
     )
+    # Preserve input lifetimes to prevent eager allocator from reusing memory while FFI kernel runs
+    inputs_tuple = (x, weight_q, weight_k, weight_v, rmsnorm_weight_c, scales_c, sin_c, cos_c)
+    q_final._base_inputs = inputs_tuple
+    k_final._base_inputs = inputs_tuple
+    v_proj_bf16._base_inputs = inputs_tuple
+    q_proj_bf16._base_inputs = inputs_tuple
+    k_proj_bf16._base_inputs = inputs_tuple
     return q_final, k_final, v_proj_bf16, q_proj_bf16, k_proj_bf16
 
 @fused_qkv_epilogue_op.register_fake
@@ -993,6 +1005,11 @@ def fused_qkv_epilogue_ckp_op(
     fwd_epi_kernel(
         q_final, k_final, q_final, k_final, rmsnorm_weight_c, scales_c, sin_c, cos_c
     )
+    # Preserve input lifetimes to prevent eager allocator from reusing memory while FFI kernel runs
+    inputs_tuple = (x, weight_q, weight_k, weight_v, rmsnorm_weight_c, scales_c, sin_c, cos_c)
+    q_final._base_inputs = inputs_tuple
+    k_final._base_inputs = inputs_tuple
+    v_proj_bf16._base_inputs = inputs_tuple
     return q_final, k_final, v_proj_bf16
 
 @fused_qkv_epilogue_ckp_op.register_fake

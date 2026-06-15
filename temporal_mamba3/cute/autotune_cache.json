@@ -104,5 +104,133 @@
             8,
             16
         ]
+    },
+    "64_16_4_fwd": {
+        "num_warps": 4,
+        "TILE_S": 2,
+        "buf_size": 1,
+        "layout_option": "multiple",
+        "maxrregcount": 128,
+        "copy_layout_shape": [
+            8,
+            4
+        ],
+        "mma_shape": [
+            16,
+            8,
+            16
+        ]
+    },
+    "64_16_4_bwd": {
+        "num_warps": 8,
+        "TILE_S": 4,
+        "buf_size": 1,
+        "layout_option": "multiple",
+        "maxrregcount": 128,
+        "copy_layout_shape": [
+            8,
+            4
+        ],
+        "mma_shape": [
+            16,
+            8,
+            16
+        ]
+    },
+    "64_16_2_fwd": {
+        "num_warps": 4,
+        "TILE_S": 2,
+        "buf_size": 1,
+        "layout_option": "coprime",
+        "maxrregcount": 192,
+        "copy_layout_shape": [
+            8,
+            4
+        ],
+        "mma_shape": [
+            16,
+            8,
+            16
+        ]
+    },
+    "64_16_2_bwd": {
+        "num_warps": 4,
+        "TILE_S": 4,
+        "buf_size": 1,
+        "layout_option": "multiple",
+        "maxrregcount": 128,
+        "copy_layout_shape": [
+            8,
+            4
+        ],
+        "mma_shape": [
+            16,
+            8,
+            16
+        ]
+    },
+    "64_32_2_fwd": {
+        "num_warps": 4,
+        "TILE_S": 2,
+        "buf_size": 1,
+        "layout_option": "multiple",
+        "maxrregcount": 255,
+        "copy_layout_shape": [
+            8,
+            4
+        ],
+        "mma_shape": [
+            16,
+            8,
+            16
+        ]
+    },
+    "64_32_2_bwd": {
+        "num_warps": 4,
+        "TILE_S": 4,
+        "buf_size": 1,
+        "layout_option": "coprime",
+        "maxrregcount": 255,
+        "copy_layout_shape": [
+            8,
+            4
+        ],
+        "mma_shape": [
+            16,
+            8,
+            16
+        ]
+    },
+    "64_64_2_fwd": {
+        "num_warps": 4,
+        "TILE_S": 8,
+        "buf_size": 1,
+        "layout_option": "multiple",
+        "maxrregcount": 192,
+        "copy_layout_shape": [
+            8,
+            4
+        ],
+        "mma_shape": [
+            16,
+            8,
+            16
+        ]
+    },
+    "64_64_2_bwd": {
+        "num_warps": 4,
+        "TILE_S": 1,
+        "buf_size": 1,
+        "layout_option": "multiple",
+        "maxrregcount": 128,
+        "copy_layout_shape": [
+            8,
+            4
+        ],
+        "mma_shape": [
+            16,
+            8,
+            16
+        ]
     }
 }
