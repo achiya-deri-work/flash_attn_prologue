@@ -1309,11 +1309,7 @@ def qknorm_rope_scale_cute_backward_op(
     grad_q_out_matched = grad_q_out if grad_q_out.stride() == q_strides_compact else torch.empty_strided(q.shape, q_strides_compact, dtype=grad_q_out.dtype, device=grad_q_out.device).copy_(grad_q_out)
     grad_k_out_matched = grad_k_out if grad_k_out.stride() == k_strides_compact else torch.empty_strided(k.shape, k_strides_compact, dtype=grad_k_out.dtype, device=grad_k_out.device).copy_(grad_k_out)
 
-    # Zero out potential garbage in the padded region of grad_q_out/grad_k_out
-    active_mask = (cos.abs().sum(dim=(0, 1, 3)) > 1e-6).to(dtype=grad_q_out_matched.dtype, device=grad_q_out_matched.device)
-    active_mask_4d = active_mask.view(1, 1, -1, 1)
-    grad_q_out_matched = grad_q_out_matched * active_mask_4d
-    grad_k_out_matched = grad_k_out_matched * active_mask_4d
+
 
     rmsnorm_weight_c = rmsnorm_weight if rmsnorm_weight.is_contiguous() else rmsnorm_weight.contiguous()
     scales_c = scales if scales.is_contiguous() else scales.contiguous()
@@ -2664,11 +2660,7 @@ def qknorm_rope_scale_cute_inverse_backward_op(
     grad_q_out_matched = grad_q_out if grad_q_out.stride() == q_strides_compact else torch.empty_strided(q_out.shape, q_strides_compact, dtype=grad_q_out.dtype, device=grad_q_out.device).copy_(grad_q_out)
     grad_k_out_matched = grad_k_out if grad_k_out.stride() == k_strides_compact else torch.empty_strided(k_out.shape, k_strides_compact, dtype=grad_k_out.dtype, device=grad_k_out.device).copy_(grad_k_out)
 
-    # Zero out potential garbage in the padded region of grad_q_out/grad_k_out
-    active_mask = (cos.abs().sum(dim=(0, 1, 3)) > 1e-6).to(dtype=grad_q_out_matched.dtype, device=grad_q_out_matched.device)
-    active_mask_4d = active_mask.view(1, 1, -1, 1)
-    grad_q_out_matched = grad_q_out_matched * active_mask_4d
-    grad_k_out_matched = grad_k_out_matched * active_mask_4d
+
     
     q_strides = tuple(int(s) for s in q_strides_compact)
     k_strides = tuple(int(s) for s in k_strides_compact)
