@@ -1390,8 +1390,6 @@ def qknorm_rope_scale_cute_backward_op(
     inputs_tuple = (q_matched, k_matched, rmsnorm_weight_c, scales_c, sin_c, cos_c, grad_q_out_matched, grad_k_out_matched)
     grad_q._base_inputs = inputs_tuple
     grad_k._base_inputs = inputs_tuple
-    grad_rmsnorm_weight._base_inputs = inputs_tuple
-    grad_scales._base_inputs = inputs_tuple
     return grad_q, grad_k, grad_rmsnorm_weight, grad_scales
 
 @qknorm_rope_scale_cute_backward_op.register_fake
@@ -2741,8 +2739,6 @@ def qknorm_rope_scale_cute_inverse_backward_op(
     inputs_tuple = (q_matched, k_matched, rmsnorm_weight_c, scales_c, sin_c, cos_c, grad_q_out_matched, grad_k_out_matched, rms_q_c, rms_k_c)
     grad_q._base_inputs = inputs_tuple
     grad_k._base_inputs = inputs_tuple
-    grad_rmsnorm_weight._base_inputs = inputs_tuple
-    grad_scales._base_inputs = inputs_tuple
     return grad_q, grad_k, grad_rmsnorm_weight, grad_scales
 
 @qknorm_rope_scale_cute_inverse_backward_op.register_fake
