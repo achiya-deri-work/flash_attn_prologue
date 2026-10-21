@@ -9,3 +9,8 @@ dist/
 *.fatbin
 *.o
 *.ptx
+
+# Local run artifacts
+*.log
+/autotune_cache.json
+**/autotune_cache_backup.json

@@ -1,9 +1,12 @@
 # Copyright (c) 2025 Achiya Deri.
 # All rights reserved.
 
+import math
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 from typing import Tuple
+from ..inductor_fused import qknorm_rope_scale
 
 
 class RMSNorm(nn.Module):
@@ -30,7 +33,7 @@ class RMSNorm(nn.Module):
     def _norm(self, x: Tensor) -> Tensor:
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    def forward(self, x: Tensor) -> Tensor: 
+    def forward(self, x: Tensor) -> Tensor:
         """Forward pass."""
         output = self._norm(x.float()).type_as(x)
         if self.weight is not None:
@@ -41,7 +44,7 @@ class RMSNorm(nn.Module):
 class QKRMSNorm(nn.Module):
     """
     RMSNorm specialized for Query/Key normalization in Attention.
-    
+
     Normalizes the last dimension of Q and K.
     """
     def __init__(self, head_dim: int, eps: float = 1e-5):
@@ -60,7 +63,7 @@ class QKRMSNorm(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         """
         Forward pass.
-        
+
         Args:
            x: Input tensor containing Q and K.
         Returns:
@@ -73,7 +76,7 @@ class QKRMSNorm(nn.Module):
 class SplitQKRMSNorm(nn.Module):
     """
     RMSNorm specialized for Cross-Attention Query/Key normalization.
-    
+
     Maintains separate weights for Query and Key normalization.
     """
     def __init__(self, head_dim: int, eps: float = 1e-5):
@@ -94,7 +97,7 @@ class SplitQKRMSNorm(nn.Module):
     def forward(self, q: Tensor, k: Tensor) -> Tuple[Tensor, Tensor]:
         """
         Forward pass for split Q and K.
-        
+
         Args:
            q: Query tensor.
            k: Key tensor.
@@ -145,27 +148,29 @@ class RMSNormRoPEScale(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.eps = eps
-        
+
         # Store weights and scales as BFloat16 parameters
         self.rmsnorm_weight = nn.Parameter(torch.ones(2, 1, head_dim, dtype=torch.bfloat16))
         self.scales = nn.Parameter(torch.empty(num_heads, 1, 1, dtype=torch.bfloat16))
         self.reset_parameters()
-        
+
     def reset_parameters(self) -> None:
-        import math
         nn.init.constant_(self.rmsnorm_weight, 1.0)
         nn.init.constant_(self.scales, math.log(self.head_dim ** -0.5))
-        
+
     def forward(self, q: Tensor, k: Tensor, sin: Tensor, cos: Tensor) -> Tuple[Tensor, Tensor]:
         N = q.shape[2]
-        if N % 128 != 0:
+        if N < 96:
+            return qknorm_rope_scale(
+                q, k, self.rmsnorm_weight, self.scales, sin, cos, self.eps
+            )
+        elif N % 128 != 0:
             pad_len = 128 - (N % 128)
-            import torch.nn.functional as F
             q_padded = F.pad(q, (0, 0, 0, pad_len))
             k_padded = F.pad(k, (0, 0, 0, pad_len))
             sin_padded = F.pad(sin, (0, 0, 0, pad_len))
             cos_padded = F.pad(cos, (0, 0, 0, pad_len))
-            
+
             q_out_padded, k_out_padded = torch.ops.flash_prologue.qknorm_rope_scale_cute(
                 q_padded, k_padded, self.rmsnorm_weight, self.scales, sin_padded, cos_padded, self.eps
             )
@@ -174,5 +179,3 @@ class RMSNormRoPEScale(nn.Module):
             return torch.ops.flash_prologue.qknorm_rope_scale_cute(
                 q, k, self.rmsnorm_weight, self.scales, sin, cos, self.eps
             )
-
-

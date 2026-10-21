@@ -500,3 +500,8 @@
     - **Removed Active Sequence Masking**: Removed the redundant `active_mask` zero-masking logic from the backward epilogue operators (`fused_epilogue.py`) since the sequence data does not contain padding, avoiding unnecessary masking overhead.
     - **Verification**: Verified 100% correctness parity (outputs and gradients) under compilation with zero graph breaks, passing all tests.
 
+84. **RMSNormRoPEScale Hybrid Execution & Non-Module Imports (June 2026)**:
+    - **Optimization**: Updated the [RMSNormRoPEScale](file:///home/achiya/vs_code_main/flash_attn_prologue/flash_attn_prologue/layers/RMSNorm.py#L138) module to route sequence lengths $N < 96$ to the native PyTorch function [qknorm_rope_scale](file:///home/achiya/vs_code_main/flash_attn_prologue/flash_attn_prologue/inductor_fused.py#L93), allowing Inductor to compile and fuse the entire forward/backward pass on the fly. Sequences $\geq 96$ continue to run via the high-performance CuTe CUDA kernel.
+    - **Imports Clean-up**: Lifted all inline library imports (`math`, `torch.nn.functional`) outside the `nn.Module` to the top of the file to prevent module pollution.
+    - **Verification**: Parameterized the test suite [test_fused_epilogue_module.py](file:///home/achiya/vs_code_main/flash_attn_prologue/tests/test_fused_epilogue_module.py) to run sequence lengths $N = 64, 100, 128, 512$ under eager and compiled modes. All tests pass with 100% correct numerical and gradient parity.
+
