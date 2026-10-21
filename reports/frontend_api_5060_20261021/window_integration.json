@@ -1,0 +1,166 @@
+{
+  "status": "passed",
+  "compile": "fullgraph=True,dynamic=False; one forward graph per backend across geometry changes",
+  "records": [
+    {
+      "backend": "native",
+      "shapes": [
+        [
+          8,
+          8
+        ],
+        [
+          13,
+          17
+        ]
+      ],
+      "metrics": {
+        "output": {
+          "max_abs": 0.00390625,
+          "relative_l2": 0.00012921910092700273,
+          "cosine": 1.0
+        },
+        "d_raw_qkv": {
+          "max_abs": 0.00048828125,
+          "relative_l2": 5.7305751397507265e-06,
+          "cosine": 1.0
+        },
+        "d_sink": {
+          "max_abs": 1.1324882507324219e-06,
+          "relative_l2": 7.696559123360203e-07,
+          "cosine": 1.0
+        },
+        "d_norm_weight": {
+          "max_abs": 2.86102294921875e-06,
+          "relative_l2": 1.4211575205536064e-07,
+          "cosine": 0.9999998807907104
+        },
+        "d_log_scale": {
+          "max_abs": 7.62939453125e-06,
+          "relative_l2": 2.1964940799534816e-07,
+          "cosine": 1.0000001192092896
+        }
+      }
+    },
+    {
+      "backend": "native",
+      "shapes": [
+        [
+          9,
+          9
+        ],
+        [
+          12,
+          16
+        ]
+      ],
+      "metrics": {
+        "output": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 0.9999998807907104
+        },
+        "d_raw_qkv": {
+          "max_abs": 0.0001220703125,
+          "relative_l2": 1.6632577626296552e-06,
+          "cosine": 1.0000001192092896
+        },
+        "d_sink": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 1.0000001192092896
+        },
+        "d_norm_weight": {
+          "max_abs": 2.86102294921875e-06,
+          "relative_l2": 1.63036474987166e-07,
+          "cosine": 0.9999999403953552
+        },
+        "d_log_scale": {
+          "max_abs": 4.76837158203125e-06,
+          "relative_l2": 9.79991128247093e-08,
+          "cosine": 0.9999998807907104
+        }
+      }
+    },
+    {
+      "backend": "cute",
+      "shapes": [
+        [
+          8,
+          8
+        ],
+        [
+          13,
+          17
+        ]
+      ],
+      "metrics": {
+        "output": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 1.0
+        },
+        "d_raw_qkv": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 1.0000001192092896
+        },
+        "d_sink": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 1.0
+        },
+        "d_norm_weight": {
+          "max_abs": 3.814697265625e-06,
+          "relative_l2": 1.4293313199686963e-07,
+          "cosine": 0.9999999403953552
+        },
+        "d_log_scale": {
+          "max_abs": 7.62939453125e-06,
+          "relative_l2": 1.0050806054096029e-07,
+          "cosine": 1.0
+        }
+      }
+    },
+    {
+      "backend": "cute",
+      "shapes": [
+        [
+          9,
+          9
+        ],
+        [
+          12,
+          16
+        ]
+      ],
+      "metrics": {
+        "output": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 1.0
+        },
+        "d_raw_qkv": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 0.9999999403953552
+        },
+        "d_sink": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 0.9999999403953552
+        },
+        "d_norm_weight": {
+          "max_abs": 3.814697265625e-06,
+          "relative_l2": 1.312127579922162e-07,
+          "cosine": 1.0
+        },
+        "d_log_scale": {
+          "max_abs": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 1.0
+        }
+      }
+    }
+  ]
+}

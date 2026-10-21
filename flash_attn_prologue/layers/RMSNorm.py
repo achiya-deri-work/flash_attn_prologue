@@ -139,43 +139,61 @@ class RMSNorm2d(nn.Module):
 
 
 class RMSNormRoPEScale(nn.Module):
-    """
-    Fused epilogue layer implementing QK normalization, RoPE, and scaling in a single JIT operator.
-    Stores weights and scales in BFloat16 and takes split Q and K.
-    """
-    def __init__(self, num_heads: int, head_dim: int, eps: float = 1e-5):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.eps = eps
+    """Packed/dense prologue with FP32 master affine and log-scale parameters.
 
-        # Store weights and scales as BFloat16 parameters
-        self.rmsnorm_weight = nn.Parameter(torch.ones(2, 1, head_dim, dtype=torch.bfloat16))
-        self.scales = nn.Parameter(torch.empty(num_heads, 1, 1, dtype=torch.bfloat16))
+    initial_scale multiplies Q only; use 1.0 when attention applies 1/sqrt(D).
+    The legacy default is 1/sqrt(D), requiring attention softmax_scale=1.
+    native is traceable PyTorch (Inductor-fused when compiled); cute selects
+    registered CUDA kernels explicitly, without an implicit length switch.
+    State-dict names/shapes remain rmsnorm_weight [2,1,D], scales [H,1,1].
+    """
+    def __init__(self, num_heads: int, head_dim: int, eps: float = 1e-5,
+                 *, initial_scale=None, backend: str = "native"):
+        super().__init__()
+        if num_heads <= 0 or head_dim <= 0 or head_dim % 2:
+            raise ValueError("num_heads must be positive and head_dim positive/even")
+        if not math.isfinite(eps) or eps <= 0:
+            raise ValueError("eps must be finite and positive")
+        initial_scale = head_dim ** -0.5 if initial_scale is None else initial_scale
+        if not math.isfinite(initial_scale) or initial_scale <= 0:
+            raise ValueError("initial_scale must be finite and positive")
+        from ..functional import prepare_backend
+        prepare_backend(backend)
+        self.num_heads, self.head_dim, self.eps = num_heads, head_dim, eps
+        self.initial_scale, self.backend = initial_scale, backend
+        self.rmsnorm_weight = nn.Parameter(torch.empty(2, 1, head_dim, dtype=torch.float32))
+        self.scales = nn.Parameter(torch.empty(num_heads, 1, 1, dtype=torch.float32))
         self.reset_parameters()
 
+    def _apply(self, fn, recurse=True):
+        # Let PyTorch own Parameter/device/gradient conversion, while preserving
+        # FP32 values rather than rounding them through a requested BF16 cast.
+        def preserve_master(tensor):
+            target = fn(tensor)
+            if tensor.is_meta or target.is_meta:
+                return target.float()
+            return tensor.to(device=target.device, dtype=torch.float32)
+        return super()._apply(preserve_master, recurse=recurse)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # assign=True must not replace FP32 masters with BF16 checkpoint tensors.
+        for name in ("rmsnorm_weight", "scales"):
+            key = prefix + name
+            if key in state_dict:
+                state_dict[key] = state_dict[key].float()
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                      missing_keys, unexpected_keys, error_msgs)
+
+    def bfloat(self):
+        """Project convention alias; FP32 norm/scale masters remain FP32."""
+        return self.bfloat16()
+
     def reset_parameters(self) -> None:
-        nn.init.constant_(self.rmsnorm_weight, 1.0)
-        nn.init.constant_(self.scales, math.log(self.head_dim ** -0.5))
+        nn.init.ones_(self.rmsnorm_weight)
+        nn.init.constant_(self.scales, math.log(self.initial_scale))
 
     def forward(self, q: Tensor, k: Tensor, sin: Tensor, cos: Tensor) -> Tuple[Tensor, Tensor]:
-        N = q.shape[2]
-        if N < 96:
-            return qknorm_rope_scale(
-                q, k, self.rmsnorm_weight, self.scales, sin, cos, self.eps
-            )
-        elif N % 128 != 0:
-            pad_len = 128 - (N % 128)
-            q_padded = F.pad(q, (0, 0, 0, pad_len))
-            k_padded = F.pad(k, (0, 0, 0, pad_len))
-            sin_padded = F.pad(sin, (0, 0, 0, pad_len))
-            cos_padded = F.pad(cos, (0, 0, 0, pad_len))
-
-            q_out_padded, k_out_padded = torch.ops.flash_prologue.qknorm_rope_scale_cute(
-                q_padded, k_padded, self.rmsnorm_weight, self.scales, sin_padded, cos_padded, self.eps
-            )
-            return q_out_padded[:, :, :N, :], k_out_padded[:, :, :N, :]
-        else:
-            return torch.ops.flash_prologue.qknorm_rope_scale_cute(
-                q, k, self.rmsnorm_weight, self.scales, sin, cos, self.eps
-            )
+        from ..functional import qknorm_rope_scale
+        return qknorm_rope_scale(q, k, self.rmsnorm_weight, self.scales,
+                                 sin, cos, self.eps, backend=self.backend)

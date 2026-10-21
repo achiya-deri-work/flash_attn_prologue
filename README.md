@@ -1,6 +1,94 @@
-# Flash Attention Prologue with CuTe Python DSL
+# Flash Attention Prologue
 
-This project contains a high-performance custom CUDA kernel implementation for a fused QKV projection and epilogue using the NVIDIA CuTe Python DSL (`cutlass.cute`). It fuses linear QKV projection, RMSNorm, Rotary Position Embedding (RoPE), and query scaling into a single fused GPU kernel.
+The supported frontend normalizes Q/K, applies split-half RoPE, and scales Q.
+It accepts packed `[tokens, heads, head_dim]` or dense `[batch, heads, sequence,
+head_dim]` tensors. The operation is per token: positions and per-image/prompt
+RoPE resets belong to the caller, and no `cu_seqlens` or per-image padding is
+needed here.
+
+## Installation
+
+```bash
+pip install -e .
+```
+
+Quack is a normal `quack-kernels` dependency from PyPI. No cloned or patched
+Quack checkout is required. The local `quack/` developer directory is ignored
+and is not shipped in wheels. Package discovery includes the frontend layers
+but excludes archived experiments, diagnostic scripts, and the separate Mamba
+project. CUDA tests must use a compatible CUDA-enabled PyTorch installation.
+
+## Public API
+
+```python
+import torch
+from flash_attn_prologue import RMSNormRoPEScale, qknorm_rope_scale
+
+# q/k: BF16 [tokens, heads, head_dim]
+# sin/cos: FP32 [tokens, head_dim // 2]
+prologue = RMSNormRoPEScale(
+    num_heads=4, head_dim=32, initial_scale=1.0, backend="native"
+).cuda().bfloat()
+prologue.reset_parameters()  # Fresh initialization only; never reset a checkpoint.
+compiled = torch.compile(prologue, fullgraph=True, dynamic=False)
+q_out, k_out = compiled(q, k, sin, cos)
+```
+
+`initial_scale=1.0` is appropriate when the attention operator already applies
+`1/sqrt(head_dim)`, including FlashDETR's packed window attention. The legacy
+default is `1/sqrt(head_dim)`; use attention scale **1** with that default.
+The learned `scales` parameter stores the logarithm of the multiplier applied
+to Q, not K. Do not apply the attention scale twice.
+
+The functional API is:
+
+```python
+q_out, k_out = qknorm_rope_scale(
+    q, k, rmsnorm_weight, scales, sin, cos, eps=1e-5, backend="native"
+)
+```
+
+- `rmsnorm_weight`: FP32 `[2, 1, head_dim]`.
+- `scales`: FP32 `[heads, 1, 1]`.
+- Packed frequencies: FP32 `[tokens, head_dim/2]` or `[tokens, 1, head_dim/2]`.
+- Dense frequencies: FP32 `[sequence, head_dim/2]`, `[batch, sequence,
+  head_dim/2]`, or `[batch, 1, sequence, head_dim/2]`, with supported singleton
+  batch/sequence broadcasting. Frequencies are shared across heads.
+- Norm reduction, affine multiplication, RoPE, and query scaling run in FP32;
+  outputs are cast once to the Q/K input dtype. Inputs are not mutated.
+- The module keeps FP32 norm and scale parameters through dtype conversion.
+  State-dict keys remain `rmsnorm_weight` and `scales`.
+
+## Backends and support boundaries
+
+`native` is traceable PyTorch and supports CPU/CUDA, BF16/FP16/FP32 inputs,
+arbitrary positive finite epsilon, and gradients through Q/K, affine weights,
+log-scales, sine and cosine. It can be fused by Inductor; eager execution is
+not a custom CuTe kernel.
+
+`cute` explicitly selects the existing CUDA kernels. Its frontend currently
+requires CUDA BF16 Q/K, head dimension 32 or 64, epsilon `1e-5`, and fixed
+sine/cosine tensors without gradients. Unsupported requests raise errors.
+There is no implicit short-sequence backend switch. The module prepares this
+backend at construction; functional callers must call
+`prepare_backend("cute")` before compilation. The backend is opaque to
+Inductor, with registered fake and first-order autograd implementations.
+Second-order CuTe gradients are not part of this support contract. The wrapper
+may copy unusual channel-strided or misaligned views to satisfy kernel memory
+requirements; ordinary packed QKV views do not require image padding.
+
+Importing the public frontend does not eagerly load GPU kernels or override
+CUDA architecture environment variables. Legacy exports remain lazy and are
+separate from the qualified frontend surface. See the [qualification report](reports/frontend_api_5060_20261021/REPORT.md)
+for executed shapes, gradients, compiler checks, and remaining limitations;
+frontend stabilization does not qualify every archived GEMM/Mamba experiment.
+
+## Historical implementation notes
+
+The following notes describe earlier experiments and historical performance
+claims. They are not the current frontend contract or a fresh qualification.
+In particular, the current standalone CuTe norm/RoPE/scale operator allocates
+separate outputs; it does not mutate Q/K in place.
 
 ## Features
 

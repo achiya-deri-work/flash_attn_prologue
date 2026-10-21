@@ -4,9 +4,6 @@ import math
 from typing import Tuple
 
 
-# Set architecture target to Blackwell
-os.environ["CUTE_DSL_ARCH"] = "sm_120a"
-os.environ["QUACK_ARCH"] = "sm_120a"
 
 import cutlass
 import cutlass.cute as cute
@@ -14,6 +11,13 @@ from cutlass import BFloat16, Float32, Int32, Int64, Boolean, const_expr
 from cutlass.cute.nvgpu import cpasync
 from quack.compile_utils import make_fake_tensor
 from flash_attn_prologue.autotune import get_autotuned_config
+
+def _aligned_tensor(t, alignment=16):
+    # Fake compilation assumes this pointer alignment. contiguous() alone does
+    # not repair a storage-offset view that already has contiguous strides.
+    if t.data_ptr() % alignment or t.stride(-1) != 1:
+        return t.clone(memory_format=torch.contiguous_format)
+    return t
 
 def _ensure_4d(t: torch.Tensor) -> torch.Tensor:
     if t.ndim == 5:
@@ -705,6 +709,18 @@ def qknorm_rope_scale_cute_op(
     cos: torch.Tensor,
     eps: float = 1e-5
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if eps != 1e-5:
+        raise ValueError("Legacy CuTe prologue supports only eps=1e-5")
+    if any(n > 1 and st == 0 for t in (q, k) for n, st in zip(t.shape, t.stride())):
+        raise ValueError("Raw CuTe does not support expanded activations; use the public frontend")
+    if q.stride(-1) != 1 or k.stride(-1) != 1:
+        raise ValueError("Raw CuTe requires channel stride 1; use the public frontend")
+    original_q_strides = _get_compact_strides(q.shape, q.stride())
+    original_k_strides = _get_compact_strides(k.shape, k.stride())
+    q, k = _aligned_tensor(q), _aligned_tensor(k)
+    rmsnorm_weight = _aligned_tensor(rmsnorm_weight, 64)
+    scales = _aligned_tensor(scales, 4)
+    sin, cos = _aligned_tensor(sin), _aligned_tensor(cos)
     sin = _ensure_4d(sin)
     cos = _ensure_4d(cos)
     B = int(q.shape[0])
@@ -712,8 +728,8 @@ def qknorm_rope_scale_cute_op(
     N = int(q.shape[2])
     head_dim = int(q.shape[3])
     
-    q_out_strides = _get_compact_strides(q.shape, q.stride())
-    k_out_strides = _get_compact_strides(k.shape, k.stride())
+    q_out_strides = original_q_strides
+    k_out_strides = original_k_strides
     
     q_in_strides = tuple(int(s) for s in q.stride())
     k_in_strides = tuple(int(s) for s in k.stride())
@@ -734,7 +750,7 @@ def qknorm_rope_scale_cute_op(
     )
     fwd_kernel = _epilogue_fwd_kernel_cache.get(cache_key)
     if fwd_kernel is None:
-        config = get_autotuned_config(M=N, N=num_heads, K=head_dim, is_fused="epilogue_fwd")
+        config = {"BLOCK_M": 64, "HEAD_GROUP": 1, "ab_stage": 1, "num_warps": 4}
         BLOCK_M = config["BLOCK_M"]
         HEAD_GROUP = config["HEAD_GROUP"]
         ab_stage = config["ab_stage"]
@@ -800,6 +816,10 @@ def qknorm_rope_scale_cute_op(
 
 @qknorm_rope_scale_cute_op.register_fake
 def _qknorm_rope_scale_cute_fake(q, k, rmsnorm_weight, scales, sin, cos, eps=1e-5):
+    if any(n > 1 and st == 0 for t in (q, k) for n, st in zip(t.shape, t.stride())):
+        raise ValueError("Raw CuTe does not support expanded activations; use the public frontend")
+    if q.stride(-1) != 1 or k.stride(-1) != 1:
+        raise ValueError("Raw CuTe requires channel stride 1; use the public frontend")
     q_out_strides = _get_compact_strides(q.shape, q.stride())
     k_out_strides = _get_compact_strides(k.shape, k.stride())
     return (
@@ -1293,19 +1313,33 @@ def qknorm_rope_scale_cute_backward_op(
     grad_k_out: torch.Tensor,
     eps: float = 1e-5
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if eps != 1e-5:
+        raise ValueError("Legacy CuTe prologue supports only eps=1e-5")
+    if any(n > 1 and st == 0 for t in (q, k) for n, st in zip(t.shape, t.stride())):
+        raise ValueError("Raw CuTe does not support expanded activations; use the public frontend")
+    if q.stride(-1) != 1 or k.stride(-1) != 1:
+        raise ValueError("Raw CuTe requires channel stride 1; use the public frontend")
+    original_q_strides = _get_compact_strides(q.shape, q.stride())
+    original_k_strides = _get_compact_strides(k.shape, k.stride())
+    q, k = _aligned_tensor(q), _aligned_tensor(k)
+    rmsnorm_weight = _aligned_tensor(rmsnorm_weight, 64)
+    scales = _aligned_tensor(scales, 4)
+    sin, cos = _aligned_tensor(sin), _aligned_tensor(cos)
     sin = _ensure_4d(sin)
     cos = _ensure_4d(cos)
     B = int(q.shape[0])
     num_heads = int(q.shape[1])
     N = int(q.shape[2])
     head_dim = int(q.shape[3])
-    q_strides_compact = _get_compact_strides(q.shape, q.stride())
-    k_strides_compact = _get_compact_strides(k.shape, k.stride())
+    q_strides_compact = original_q_strides
+    k_strides_compact = original_k_strides
 
 
     q_matched = q if q.stride() == q_strides_compact else torch.empty_strided(q.shape, q_strides_compact, dtype=q.dtype, device=q.device).copy_(q)
     k_matched = k if k.stride() == k_strides_compact else torch.empty_strided(k.shape, k_strides_compact, dtype=k.dtype, device=k.device).copy_(k)
     
+    grad_q_out = _aligned_tensor(grad_q_out)
+    grad_k_out = _aligned_tensor(grad_k_out)
     grad_q_out_matched = grad_q_out if grad_q_out.stride() == q_strides_compact else torch.empty_strided(q.shape, q_strides_compact, dtype=grad_q_out.dtype, device=grad_q_out.device).copy_(grad_q_out)
     grad_k_out_matched = grad_k_out if grad_k_out.stride() == k_strides_compact else torch.empty_strided(k.shape, k_strides_compact, dtype=grad_k_out.dtype, device=grad_k_out.device).copy_(grad_k_out)
 
@@ -1332,7 +1366,7 @@ def qknorm_rope_scale_cute_backward_op(
     )
     back_kernel = _epilogue_bwd_kernel_cache.get(cache_key)
     if back_kernel is None:
-        config = get_autotuned_config(M=N, N=num_heads, K=head_dim, is_fused="epilogue_bwd")
+        config = {"BLOCK_M": 64, "HEAD_GROUP": 1, "ab_stage": 1, "num_warps": 4}
         BLOCK_M = config["BLOCK_M"]
         HEAD_GROUP = config["HEAD_GROUP"]
         ab_stage = config["ab_stage"]
@@ -1390,6 +1424,10 @@ def qknorm_rope_scale_cute_backward_op(
 
 @qknorm_rope_scale_cute_backward_op.register_fake
 def _qknorm_rope_scale_cute_backward_fake(q, k, rmsnorm_weight, scales, sin, cos, grad_q_out, grad_k_out, eps=1e-5):
+    if any(n > 1 and st == 0 for t in (q, k) for n, st in zip(t.shape, t.stride())):
+        raise ValueError("Raw CuTe does not support expanded activations; use the public frontend")
+    if q.stride(-1) != 1 or k.stride(-1) != 1:
+        raise ValueError("Raw CuTe requires channel stride 1; use the public frontend")
     q_strides_compact = _get_compact_strides(q.shape, q.stride())
     k_strides_compact = _get_compact_strides(k.shape, k.stride())
     grad_q = torch.empty_strided(q.shape, q_strides_compact, dtype=q.dtype, device=q.device)

@@ -1,47 +1,36 @@
-import os
-import sys
-from pathlib import Path
-
-# Automatically discover and set CUTE_DSL_LIBS environment variable if not already set.
-if "CUTE_DSL_LIBS" not in os.environ:
-    # Search all sys.path directories for nvidia_cutlass_dsl runtime library
-    for p in sys.path:
-        candidate = Path(p) / "nvidia_cutlass_dsl" / "lib" / "libcute_dsl_runtime.so"
-        if candidate.exists():
-            os.environ["CUTE_DSL_LIBS"] = str(candidate.resolve())
-            break
-    # Fallback to sys.prefix site-packages
-    if "CUTE_DSL_LIBS" not in os.environ:
-        prefix_path = Path(sys.prefix)
-        candidate = prefix_path / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages" / "nvidia_cutlass_dsl" / "lib" / "libcute_dsl_runtime.so"
-        if candidate.exists():
-            os.environ["CUTE_DSL_LIBS"] = str(candidate.resolve())
-
-from .epilogue_kernel import qknorm_rope_scale_op
-from .fused_epilogue import qknorm_rope_scale_cute_op, qknorm_rope_scale_cute_backward_op, qknorm_rope_scale_cute_inverse_op
-from .fused_qkv import (
-    fused_qkv_op as fused_qkv,
-    fused_qkv_epilogue_op as fused_qkv_epilogue,
-    fused_qkv_epilogue_ckp_op as fused_qkv_epilogue_ckp
-)
-from .gemm_bwd import matmul_bwd_dx, matmul_bwd_dw, fused_qkv_backward
+"""Q/K prologue APIs; optional legacy CUDA kernels are imported on demand."""
+from importlib import import_module
+from .functional import qknorm_rope_scale, prepare_backend
 from .layers.RMSNorm import RMSNormRoPEScale
-from .coordinate_descent import CoordinateDescentAutotuner
 
-__all__ = [
-    "qknorm_rope_scale_op",
-    "qknorm_rope_scale_cute_op",
-    "qknorm_rope_scale_cute_backward_op",
-    "qknorm_rope_scale_cute_inverse_op",
-    "fused_qkv",
-    "fused_qkv_epilogue",
-    "fused_qkv_epilogue_ckp",
-    "matmul_bwd_dx",
-    "matmul_bwd_dw",
-    "fused_qkv_backward",
-    "RMSNormRoPEScale",
-    "CoordinateDescentAutotuner",
-]
-
+_LEGACY = {
+    "qknorm_rope_scale_op": ("epilogue_kernel", "qknorm_rope_scale_op"),
+    "qknorm_rope_scale_cute_op": ("fused_epilogue", "qknorm_rope_scale_cute_op"),
+    "qknorm_rope_scale_cute_backward_op": ("fused_epilogue", "qknorm_rope_scale_cute_backward_op"),
+    "qknorm_rope_scale_cute_inverse_op": ("fused_epilogue", "qknorm_rope_scale_cute_inverse_op"),
+    "fused_qkv": ("fused_qkv", "fused_qkv_op"),
+    "fused_qkv_epilogue": ("fused_qkv", "fused_qkv_epilogue_op"),
+    "fused_qkv_epilogue_ckp": ("fused_qkv", "fused_qkv_epilogue_ckp_op"),
+    "matmul_bwd_dx": ("gemm_bwd", "matmul_bwd_dx"),
+    "matmul_bwd_dw": ("gemm_bwd", "matmul_bwd_dw"),
+    "fused_qkv_backward": ("gemm_bwd", "fused_qkv_backward"),
+    "CoordinateDescentAutotuner": ("coordinate_descent", "CoordinateDescentAutotuner"),
+}
+__all__ = ["qknorm_rope_scale", "prepare_backend", "RMSNormRoPEScale", *_LEGACY]
 
 
+def __getattr__(name):
+    if name not in _LEGACY:
+        raise AttributeError(name)
+    module, symbol = _LEGACY[name]
+    if module == "epilogue_kernel":
+        import_module(".fused_epilogue", __name__)
+    if module == "fused_qkv":
+        import_module(".gemm_bwd", __name__)
+    loaded = import_module(f".{module}", __name__)
+    # Importing the submodule installs a module-valued package attribute.
+    # Restore every public alias, especially the colliding fused_qkv name.
+    for alias, (source, exported) in _LEGACY.items():
+        if source == module:
+            globals()[alias] = getattr(loaded, exported)
+    return globals()[name]

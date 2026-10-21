@@ -1,0 +1,51 @@
+.............................................F
+=================================== FAILURES ===================================
+__________ test_cute_opcheck_adversarial_layout[transposed_channels] ___________
+
+layout = 'transposed_channels'
+
+    @pytest.mark.parametrize('layout',['offset_packed','transposed_channels'])
+    def test_cute_opcheck_adversarial_layout(layout):
+        if DEVICE!='cuda':pytest.skip('CuTe needs CUDA')
+        prepare_backend('cute')
+        a=list(inputs(17,packed=False))
+        for i in (0,1):
+            if layout=='offset_packed':
+                storage=torch.randn(a[i].numel()+1,device=DEVICE,dtype=a[i].dtype)
+                a[i]=storage[1:].view(2,17,4,32).permute(0,2,1,3).requires_grad_()
+            else:
+                a[i]=torch.randn(2,4,32,17,device=DEVICE,dtype=a[i].dtype).transpose(-1,-2).requires_grad_()
+>       compare(tuple(a),'cute')
+
+prologue-api-tests.py:212: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+args = (tensor([[[[ 1.7812, -0.3340, -0.4902,  ...,  1.6797,  0.9453, -0.9805],
+          [ 0.0518, -0.5234, -0.1270,  ...,  ...         0.6043,  1.0000,  0.8133,  0.5957,  0.9578, -0.3337,  0.6108,
+           0.2912,  0.0445]]], device='cuda:0'))
+backend = 'cute', compiled = False
+
+    def compare(args,backend,compiled=False):
+        ref_args=tuple(x.detach().clone().requires_grad_(x.requires_grad) for x in args)
+        call=lambda *a:qknorm_rope_scale(*a,backend=backend)
+        if compiled:call=torch.compile(call,fullgraph=True,dynamic=False)
+        out=call(*args); ref=oracle(*ref_args)
+        probes=tuple(torch.randn_like(y.transpose(-1,-2)).transpose(-1,-2) for y in out)
+        grads=torch.autograd.grad(out,[x for x in args if x.requires_grad],probes)
+        rgrads=torch.autograd.grad(ref,[x for x in ref_args if x.requires_grad],probes)
+        metrics={}
+        for name,a,b in zip(('q','k','dq','dk','dw','ds','dsin','dcos'),out+grads,ref+rgrads):
+            assert torch.isfinite(a).all(),name
+            # BF16 output/gradient rounding; FP32 params can accumulate rounded upstream activations.
+>           torch.testing.assert_close(a,b,atol=.04,rtol=.025,msg=lambda m:name+': '+m)
+E           AssertionError: q: Tensor-likes are not close!
+E           
+E           Mismatched elements: 3889 / 4352 (89.4%)
+E           Greatest absolute difference: 3.765625 at index (1, 2, 15, 24) (up to 0.04 allowed)
+E           Greatest relative difference: 58368.0 at index (1, 2, 7, 20) (up to 0.025 allowed)
+
+prologue-api-tests.py:62: AssertionError
+=========================== short test summary info ============================
+FAILED prologue-api-tests.py::test_cute_opcheck_adversarial_layout[transposed_channels]
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed, 45 passed in 18.31s

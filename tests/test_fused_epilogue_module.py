@@ -5,6 +5,8 @@ import torch.nn as nn
 from flash_attn_prologue.layers.RMSNorm import RMSNormRoPEScale
 from flash_attn_prologue.layers.RoPE import apply_rope
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
 @pytest.mark.parametrize("N", [64, 100, 128, 512])
 def test_fused_epilogue_module_parity(N):
     B = 32
@@ -15,9 +17,9 @@ def test_fused_epilogue_module_parity(N):
     # 1. Instantiate the module
     module = RMSNormRoPEScale(num_heads=num_heads, head_dim=head_dim).to(device=device, dtype=torch.bfloat16)
 
-    # Verify that parameters are stored in BFloat16 as requested
-    assert module.rmsnorm_weight.dtype == torch.bfloat16
-    assert module.scales.dtype == torch.bfloat16
+    # Verify that parameters retain FP32 master precision
+    assert module.rmsnorm_weight.dtype == torch.float32
+    assert module.scales.dtype == torch.float32
 
     # 2. Inputs
     q = torch.randn(B, num_heads, N, head_dim, device=device, dtype=torch.bfloat16, requires_grad=True)
@@ -48,12 +50,12 @@ def test_fused_epilogue_module_parity(N):
     k_normed = k_ref.float() * torch.rsqrt(k_ref.float().pow(2).mean(-1, keepdim=True) + eps) * module.rmsnorm_weight[1, 0].float()
 
     # Apply RoPE (requires float32 sin/cos)
-    q_rotated = apply_rope(q_normed.to(torch.bfloat16), sin, cos)
-    k_rotated = apply_rope(k_normed.to(torch.bfloat16), sin, cos)
+    q_rotated = apply_rope(q_normed, sin, cos)
+    k_rotated = apply_rope(k_normed, sin, cos)
 
     # Scale Q by scales
-    q_ref_final = q_rotated * module.scales.float().exp().to(torch.bfloat16)
-    k_ref_final = k_rotated
+    q_ref_final = (q_rotated * module.scales.float().exp()).to(torch.bfloat16)
+    k_ref_final = k_rotated.to(torch.bfloat16)
 
     # 6. Verify Forward Parity
     torch.testing.assert_close(q_out, q_ref_final, rtol=1e-2, atol=1e-1)
@@ -113,11 +115,11 @@ def test_fused_epilogue_module_compiled(N):
     q_normed = q_ref.float() * torch.rsqrt(q_ref.float().pow(2).mean(-1, keepdim=True) + eps) * module.rmsnorm_weight[0, 0].float()
     k_normed = k_ref.float() * torch.rsqrt(k_ref.float().pow(2).mean(-1, keepdim=True) + eps) * module.rmsnorm_weight[1, 0].float()
 
-    q_rotated = apply_rope(q_normed.to(torch.bfloat16), sin, cos)
-    k_rotated = apply_rope(k_normed.to(torch.bfloat16), sin, cos)
+    q_rotated = apply_rope(q_normed, sin, cos)
+    k_rotated = apply_rope(k_normed, sin, cos)
 
-    q_ref_final = q_rotated * module.scales.float().exp().to(torch.bfloat16)
-    k_ref_final = k_rotated
+    q_ref_final = (q_rotated * module.scales.float().exp()).to(torch.bfloat16)
+    k_ref_final = k_rotated.to(torch.bfloat16)
 
     # Verify compiled forward output matches reference
     torch.testing.assert_close(q_out, q_ref_final, rtol=1e-2, atol=1e-1)
